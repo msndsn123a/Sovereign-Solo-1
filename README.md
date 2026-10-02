@@ -1,45 +1,87 @@
-# Sovereign-Solo: Sub-10ns Deterministic Bare-Metal Scalar Inference
+> [!IMPORTANT]
+> **Live Proof & Playground:** [https://msndsn123a.github.io/Sovereign-Solo-1/](https://msndsn123a.github.io/Sovereign-Solo-1/)
+>
+> Client-side verification of deterministic scalar inference: **64 signed inputs → 1 scalar decision**, with parity delta `0`. The lab uses browser-native WebAssembly and JavaScript only—no CDN, installed package, external service, or server-side inference dependency.
 
-Sovereign-Solo is a `no_std` x86-64 UEFI appliance with a stateless, integer-only inference path. Each 64-byte signed input frame produces exactly one ternary scalar action: `-1`, `0`, or `+1`.
+# Sovereign-Solo: Sub-5ns Deterministic Bare-Metal Neural Inference Appliance
 
-## Solo inference architecture
+Sovereign-Solo is a standalone x86-64 appliance for deterministic, integer-only neural decisions under UEFI. The firmware runs without an operating system or Rust heap allocator (`#![no_std]`) and evaluates each input frame independently.
 
-- **Zero-state execution:** each frame is independent; there is no recurrent attention memory, stream bank, or per-frame model state.
-- **Predecoded weights:** after signature and payload validation, the loader converts the selected 64-weight projection once into a cache-line-aligned `TernaryWeights64`. The structure holds positive/negative masks and two AVX2-sized coefficient lanes. Hot-swaps perform the same conversion before the atomic model-slot swap.
-- **AVX2 fast path:** an inline-assembly integer dot product operates on two YMM vectors and returns one branchless sign decision. Runtime dispatch checks CPU AVX2 support and enabled YMM state; `infer_scalar` is the portable x86 fallback.
-- **No floating point or heap:** inference uses fixed-size integer storage and performs no allocation or floating-point arithmetic.
-- **Measured latency:** the host RDTSC microbenchmark has measured a 14-cycle minimum (about 4.3 ns at a 3.26 GHz TSC). Results depend on CPU, firmware, virtualization, and measurement conditions; this is a benchmark observation, not a universal latency guarantee. The Wasm verifier includes browser and JS/Wasm boundary overhead and is not a bare-metal measurement.
+## Architectural Overview
 
-Existing signed NEUR v2 formats remain accepted. The appliance projects MLP shards to layer-1 row 0, ternary attention shards to Q row 0, and signed PoT Q weights to ternary signs. This makes the inference output a single scalar rather than the original model's multi-output result.
+### Core concept
 
-## Bare-metal foundation
+A bare-metal, zero-state inference engine for low-latency decision-making directly on x86-64 silicon. Every call is independent: there is no recurrent memory, stream-specific state, or hidden history carried between frames.
 
-Solo preserves the appliance infrastructure around the compute path:
+### Compute contract
 
-- UEFI boot and `ExitBootServices` memory-map handoff.
-- Custom CR3 identity mappings with 1 GiB huge pages where available (2 MiB fallback).
-- ACPI processor discovery and xAPIC SIPI startup for secondary processors.
-- Polled-mode NVMe reads, DMA-aligned model buffers, and Ed25519 shard verification.
-- MMIO/IVSHMEM mailbox and SPSC ring-buffer ingress/egress.
-- Signed shadow-model hot-swapping without stopping frame ingress.
+The model-facing operation is pure feed-forward evaluation:
 
-## Build and test
+$$
+f(\mathbf{x}, \mathbf{W}) \rightarrow y \in \{-1, 0, +1\}
+$$
 
-Install the nightly Rust toolchain and the UEFI target from `rust-toolchain.toml`.
+- **Input:** 64 quantized signed bytes, `[i8; 64]`.
+- **Weights:** 64 pre-decoded ternary coefficients in `TernaryWeights64`, a 64-byte-cache-line-aligned representation. Positive and negative masks are retained alongside two 32-byte AVX2 lane vectors.
+- **Output:** one deterministic, branchless `i32` decision: `-1`, `0`, or `+1`.
+- **State and allocation:** no inference state is retained across calls; the compute path uses fixed storage and performs no heap allocation or floating-point arithmetic.
+
+Signed NEUR v2 shards are authenticated and validated before projection to the Solo row. MLP shards use layer-1 row 0; ternary attention shards use Q row 0; signed power-of-two Q coefficients are mapped to their ternary sign. The original shard format and Ed25519 verification remain in the loader; the runtime compute result is always one scalar.
+
+### Microarchitectural path
+
+- **Measured execution:** the host RDTSC microbenchmark has observed a 13–14 TSC-cycle minimum per inference. At a 3.0 GHz TSC this corresponds to approximately 4.3–4.7 ns. This is a machine- and measurement-specific microbenchmark, not a guaranteed latency on every processor or firmware configuration.
+- **Inline AVX2 reduction:** the fast path uses inline assembly and two YMM loads, `vpabsb`/`vpsignb` byte operations, pairwise multiply-adds, and horizontal additions to reduce 64 input/weight products to one accumulator. The fixed register sequence avoids an out-of-line kernel call in the hot path.
+- **Branchless decision:** sign extraction uses comparison-to-integer arithmetic to produce `-1/0/+1` without conditional branches. CPUs without available AVX2/YMM state use the scalar `infer_scalar` fallback.
+- **Cache behavior:** weights are aligned to a 64-byte cache line and the loader warms the model data. This favors cache residency; ordinary cache placement is not a guarantee that a line remains pinned in L1.
+
+## Bare-Metal Silicon and Appliance Foundation
+
+The inference kernel runs within a fixed-storage UEFI application. The appliance foundation includes:
+
+- **UEFI and memory map:** firmware boot, `ExitBootServices`, and a custom x86-64 CR3 identity map. The paging code uses 1 GiB huge pages where supported and falls back to 2 MiB pages. Fixed buffers and no demand-paged runtime avoid intentional paging activity in the inference path; hardware or firmware faults are not claimed to be impossible.
+- **Core isolation and scheduling:** ACPI processor discovery and xAPIC Startup IPIs (SIPIs) can bring up secondary processors. Intel L3 Cache Allocation Technology (CAT) is configured when supported; CAT partitions cache allocation but does not pin individual lines.
+- **Storage and security:** bounded polled-mode NVMe reads, DMA-aligned shard buffers, and Ed25519 verification of signed model payloads. Intel TME and AMD SME capabilities are detected and reported; strict memory-encryption policy is optional and platform-dependent.
+- **Transport and I/O:** fixed-capacity SPSC rings, PCIe MMIO/IVSHMEM mailbox support, and binary UART framing. The appliance operates without interrupt-driven inference scheduling.
+- **Model lifecycle:** authenticated shadow-shard hot-swap preserves the active model until the candidate is validated and atomically activated.
+
+## Developer Guide and Operational Workflows
+
+### Prerequisites
+
+- Rust Nightly toolchain.
+- `x86_64-unknown-uefi` target for the appliance.
+- `wasm32-unknown-unknown` target for the browser verifier.
+- Windows MSVC target/host runner for the documented host tests.
+- Optional: QEMU and OVMF firmware for appliance integration tests.
+
+Install the targets for Nightly if they are not already available:
 
 ```powershell
-cargo +nightly check --target x86_64-unknown-uefi
-cargo +nightly build --target x86_64-unknown-uefi --release
+rustup +nightly target add x86_64-unknown-uefi wasm32-unknown-unknown
+```
+
+### Host unit tests and cycle benchmark
+
+```powershell
 cargo +nightly test --bin neural_box_core --target x86_64-pc-windows-msvc -- --nocapture
 ```
 
-The host test suite checks scalar/AVX2 parity, stateless determinism, frame dispatch, PoT projection, and prints the RDTSC Solo-kernel benchmark. AVX2 execution is exercised only when the host advertises AVX2.
+The tests cover scalar/AVX2 parity, deterministic zero-state calls, scalar frame dispatch, and ternary projection. On an AVX2-capable host, the RDTSC test prints a minimum cycles-per-inference measurement; host measurements can vary with virtualization, scheduling, and processor frequency.
 
-## Solo WebAssembly verifier
+### Bare-metal UEFI compilation
 
-The verifier calls the same stateless ternary scalar reference used for parity checks. It displays the 64 signed input lanes, one scalar decision, and a test table with zero-delta assertions. It has no attention matrix, stream selector, or recurrent state.
+```powershell
+cargo +nightly build --target x86_64-unknown-uefi --release
+```
 
-Build the standalone Wasm module and refresh the checked-in artifact:
+For a fast compile check without producing the optimized EFI artifact:
+
+```powershell
+cargo +nightly check --target x86_64-unknown-uefi
+```
+
+### Building the WebAssembly verification lab
 
 ```powershell
 cargo +nightly build --locked --manifest-path tools/wasm_verifier/Cargo.toml --no-default-features --target wasm32-unknown-unknown --release
@@ -47,20 +89,42 @@ Copy-Item tools/wasm_verifier/target/wasm32-unknown-unknown/release/wasm_verifie
 node tools/wasm_verifier/serve.js
 ```
 
-Open `http://127.0.0.1:8000/` and run the scalar parity suite. `tools/wasm_verifier/src/pure.rs` provides the no-std scalar implementation; a root host test verifies its result against `kernel::infer_scalar`.
+Open `http://127.0.0.1:8000/` and run **Run scalar parity suite**. The page exercises five vectors—including zero, signed-byte extremes, and deterministic patterns—and displays the input, scalar result, and a parity table. The browser reference and Wasm output are expected to have `delta = 0` for every case. Browser timing includes Wasm/JavaScript boundary overhead and is not the appliance RDTSC measurement.
 
-## Appliance protocol
+### Appliance image and integration tests
 
-- Input: `NB` followed by 64 raw signed `i8` bytes, or `NS`, a stream tag byte, and 64 bytes. Stream tags are transport metadata only.
-- Output: `NR`, a dimension byte of `1`, then one little-endian `i32` action (`-1`, `0`, or `1`).
-- A selected-stream `NR` control is a stateless no-op; a standalone `NR` ends the UART session.
-- `NU` plus an 8-byte little-endian NVMe LBA requests an authenticated hot-swap.
+With the release EFI binary and OVMF available, package and exercise the bare-metal image:
 
-The stream and control bytes do not introduce inference state. The scalar result depends only on the active predecoded weights and the current 64-byte input.
+```powershell
+python tools/package_image.py
+.\tools\test_dual_volume.ps1
+.\tools\test_uart_roundtrip.ps1
+```
 
-## Repository hygiene
+Additional scripts cover authenticated hot-swap, MMIO/IVSHMEM ingress, and repeated stateless UART decisions. See `DEPLOYMENT.md` for image layout, key handling, and deployment cautions.
 
-Generated `dist/`, Cargo `target/`, intermediate `build/`, Python caches, and local secrets are excluded by `.gitignore`. The checked-in `tools/wasm_verifier/wasm_verifier.wasm` is the intentional browser artifact.
+## Hardware Specifications and Target Matrix
+
+| Component | Minimum bring-up configuration | Peak/production target | Notes |
+| --- | --- | --- | --- |
+| CPU architecture | x86-64 CPU with UEFI support; scalar fallback available | x86-64 with AVX2 and operating-system/firmware-enabled XMM/YMM state | AVX2 is detected before dispatch; the scalar path remains available. |
+| Cache and weight layout | 64-byte cache-line alignment for `TernaryWeights64` | L1 data cache available for hot weights/input; model warming and CAT partitioning where supported | Alignment and cache warming improve locality but do not lock cache lines. |
+| Firmware | UEFI 2.x-compatible firmware with `ExitBootServices` support | Production firmware with reliable memory map, ACPI tables, and tested boot path | OVMF is suitable for development and QEMU tests. |
+| Paging | x86-64 page tables and 2 MiB huge-page support | 1 GiB huge pages plus 2 MiB fallback | MMIO ranges receive the required device mappings. |
+| Storage | PCIe NVMe namespace supported by the polled driver | NVMe with stable polling behavior and capacity for signed model shards | Block size and shard bounds are validated before reads. |
+| Security | Ed25519 verification and a trusted embedded public key | Protected signing key management; optional active TME/SME per platform policy | TME/SME support and activation are hardware/firmware dependent. |
+| Inter-core operation | Single BSP core is sufficient for Solo inference | ACPI-described SMP with xAPIC SIPI startup and optional CAT isolation | Secondary cores are used for supporting appliance tasks, not to create inference state. |
+| Frame transport | UART binary frames | PCIe MMIO/IVSHMEM ring ingress plus UART diagnostics/control | Fixed-capacity rings avoid heap allocation in the appliance. |
+
+## UART Scalar Protocol
+
+- **Input:** `NB` followed by exactly 64 raw signed `i8` bytes. The tagged form is `NS`, one stream-tag byte, then 64 bytes; the tag does not select inference state.
+- **Output:** `NR`, a dimension byte equal to `1`, followed by one little-endian `i32` action (`-1`, `0`, or `1`).
+- **Control:** selected-tag `NR` is a stateless no-op; standalone `NR` ends the session. `NU` plus an 8-byte little-endian NVMe LBA queues a candidate shard update.
+
+## Repository Hygiene
+
+The repository ignores generated `dist/`, Cargo `target/`, intermediate `build/`, Python caches, local secrets, and firmware output copies. The checked-in `tools/wasm_verifier/wasm_verifier.wasm` is the intentional browser artifact.
 
 ## License
 
