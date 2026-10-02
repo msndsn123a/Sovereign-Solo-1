@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#08111f">
+  <title>Sovereign-Solo · Wasm Scalar Verifier</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: #07111e;
+      color: #e8f1fc;
+      --panel: #101e30; --border: #293d56; --muted: #92a8c1;
+      --cyan: #57d8e8; --green: #77e0ad; --red: #ff8091;
+      --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; background: radial-gradient(ellipse at 14% 0%, #153453 0, transparent 38%), #07111e; }
+    .shell { width: min(1120px, calc(100% - 32px)); margin: auto; padding: 38px 0 56px; }
+    .eyebrow { color: var(--cyan); font: 700 11px var(--mono); letter-spacing: .16em; text-transform: uppercase; }
+    h1 { margin: 13px 0 8px; font-size: clamp(32px, 6vw, 54px); line-height: 1.04; letter-spacing: -.05em; }
+    .lede { max-width: 690px; color: #a9bbd0; margin: 0; font-size: 15px; }
+    .hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 28px; margin-bottom: 25px; }
+    .mark { color: #9bb1ca; text-align: right; font: 11px/1.8 var(--mono); white-space: nowrap; }
+    .mark strong { color: #eef7ff; font-size: 15px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 13px; }
+    button { min-height: 42px; padding: 9px 15px; border: 1px solid var(--border); border-radius: 9px; color: #edf7ff; background: #142740; font: inherit; font-weight: 750; cursor: pointer; }
+    button:hover:not(:disabled) { border-color: #5c88ad; filter: brightness(1.12); }
+    button:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    button:disabled { opacity: .55; cursor: progress; }
+    .primary { border: 0; color: #051321; background: linear-gradient(135deg, #57d8e8, #78a9ff); }
+    .status { display: flex; min-height: 40px; align-items: center; gap: 11px; margin-bottom: 17px; }
+    .badge { padding: 6px 10px; border: 1px solid #465a73; border-radius: 999px; background: #14243a; color: #c5d3e4; font: 800 10px var(--mono); letter-spacing: .08em; }
+    .badge.pass { color: var(--green); border-color: #28654f; background: #102a26; }
+    .badge.fail { color: var(--red); border-color: #713944; background: #2d1b25; }
+    .badge.busy { color: #ffe09a; }
+    .status-copy { color: var(--muted); font-size: 12px; }
+    .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 11px; margin-bottom: 14px; }
+    .metric, .panel { min-width: 0; border: 1px solid var(--border); border-radius: 13px; background: linear-gradient(155deg, #13243a, var(--panel)); }
+    .metric { padding: 13px 15px; }
+    .metric-label { color: var(--muted); font: 10px var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    .metric-value { margin-top: 5px; color: #f0f7ff; font: 700 20px/1.2 var(--mono); }
+    .metric-value small { color: var(--muted); font-size: 10px; font-weight: 500; }
+    .columns { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(230px, .75fr); gap: 13px; }
+    .panel { padding: 17px; margin-top: 13px; }
+    .heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 13px; }
+    h2 { margin: 0; font-size: 14px; }
+    .sub { margin: 4px 0 0; color: var(--muted); font-size: 11px; }
+    .mono-label { color: #8198b3; text-align: right; font: 9px/1.4 var(--mono); }
+    .input-grid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 5px; }
+    .byte { display: grid; place-items: center; min-height: 31px; border: 1px solid #293d56; border-radius: 5px; background: #0c1827; color: #c1d1e3; font: 10px var(--mono); }
+    .byte.changed { border-color: var(--cyan); color: #07141d; background: var(--cyan); }
+    .byte small { color: #7790ac; font: 8px var(--mono); }
+    .byte.changed small { color: #28525d; }
+    .decision { display: grid; min-height: 205px; place-content: center; justify-items: center; border: 1px solid #2b435d; border-radius: 10px; background: radial-gradient(circle at 50% 45%, #1a3550, #0c1828 68%); }
+    .decision-label { color: #8fa8c3; font: 10px var(--mono); letter-spacing: .13em; text-transform: uppercase; }
+    .decision-value { margin: 4px 0; color: #edf8ff; font: 800 clamp(68px, 11vw, 100px)/1 var(--mono); letter-spacing: -.08em; }
+    .decision-value.positive { color: var(--green); }
+    .decision-value.negative { color: var(--red); }
+    .decision-value.zero { color: var(--cyan); }
+    .decision-copy { color: #9cb1c8; font-size: 11px; }
+    .table-wrap { overflow: auto; border: 1px solid #25384f; border-radius: 8px; }
+    table { width: 100%; border-collapse: collapse; font: 11px var(--mono); }
+    thead { position: sticky; top: 0; background: #192a40; }
+    th, td { padding: 9px 11px; border-bottom: 1px solid #203148; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: #aec1d7; font-weight: 650; }
+    td { color: #e0ebf7; }
+    .delta-zero { color: var(--green); }
+    .delta-bad { color: var(--red); font-weight: 800; }
+    .suite { display: grid; gap: 6px; margin-top: 11px; }
+    .suite-row { display: flex; justify-content: space-between; gap: 12px; padding: 7px 9px; border-radius: 6px; background: #0b1725; color: #aabbd0; font: 10px var(--mono); }
+    .suite-row strong { color: var(--green); }
+    .note { margin: 12px 2px 0; color: #92a7bf; font-size: 10px; }
+    .note code { color: #c7dcf2; font-family: var(--mono); }
+    @media (max-width: 740px) { .hero { align-items: flex-start; } .mark { display: none; } .columns { grid-template-columns: 1fr; } .shell { width: min(100% - 22px, 620px); padding-top: 25px; } }
+    @media (max-width: 430px) { .metrics { gap: 6px; } .metric { padding: 10px; } .metric-value { font-size: 16px; } .input-grid { gap: 3px; } .byte { min-height: 27px; font-size: 9px; } .actions button { flex: 1 1 100%; } }
+  </style>
+</head>
+<body>
+<main class="shell">
+  <header class="hero">
+    <div>
+      <div class="eyebrow">Sovereign-Solo · no-std Rust · WebAssembly</div>
+      <h1>One vector.<br>One decision.</h1>
+      <p class="lede">A stateless 64-lane ternary dot product with a single branchless scalar action. Compare the Wasm result against an independent integer reference; every tested delta must be zero.</p>
+    </div>
+    <div class="mark"><strong>64 → 1</strong><br>ZERO STATE<br>INTEGER ONLY</div>
+  </header>
+
+  <div class="actions">
+    <button id="run-suite" class="primary">▶ Run scalar parity suite</button>
+    <button id="random-infer">⟳ Randomize input</button>
+  </div>
+  <div class="status"><span id="badge" class="badge">READY</span><span id="status-copy" class="status-copy">Load the standalone Wasm kernel to begin.</span></div>
+
+  <section class="metrics" aria-label="Verifier metrics">
+    <div class="metric"><div class="metric-label">Wasm call average</div><div class="metric-value"><span id="latency">—</span> <small>µs</small></div></div>
+    <div class="metric"><div class="metric-label">Exact test cases</div><div class="metric-value"><span id="exact">—</span> <small>/ 5</small></div></div>
+    <div class="metric"><div class="metric-label">Output domain</div><div class="metric-value">−1 · 0 · +1</div></div>
+  </section>
+
+  <div class="columns">
+    <section class="panel">
+      <div class="heading"><div><h2>Input vector</h2><p class="sub">64 signed <code>i8</code> lanes · indices shown above values</p></div><span class="mono-label">INT8 · 64 BYTES</span></div>
+      <div id="input" class="input-grid" aria-label="Incoming 64-byte signed vector"></div>
+    </section>
+    <section class="panel">
+      <div class="heading"><div><h2>Scalar decision</h2><p class="sub">One deterministic action value</p></div><span class="mono-label">INT32</span></div>
+      <div class="decision" aria-live="polite">
+        <div class="decision-label">Solo output</div>
+        <div id="decision" class="decision-value zero">0</div>
+        <div id="decision-copy" class="decision-copy">Neutral · accumulator is zero</div>
+      </div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="heading"><div><h2>Scalar parity verification</h2><p class="sub">Independent reference vs Wasm · Δ = Wasm − reference</p></div><span class="mono-label">ONE OUTPUT<br>BIT-EXACT</span></div>
+    <div class="table-wrap"><table aria-label="Solo scalar parity table"><thead><tr><th>Input case</th><th>Reference</th><th>Wasm</th><th>Δ</th><th>Result</th></tr></thead><tbody id="rows"><tr><td colspan="5" style="text-align:center;color:#8298b2;padding:20px">Run the parity suite.</td></tr></tbody></table></div>
+    <div id="suite" class="suite" aria-live="polite"></div>
+    <p class="note">Wasm timing includes browser and JS/Wasm boundary overhead; it is not a bare-metal latency measurement. The appliance kernel uses AVX2 inline assembly with a scalar fallback. No recurrent state or floating-point inference is involved.</p>
+  </section>
+</main>
+<script type="module">
+const $ = (selector) => document.querySelector(selector);
+const runButton = $('#run-suite');
+const randomButton = $('#random-infer');
+const badge = $('#badge');
+const statusCopy = $('#status-copy');
+const app = { runtime: null, previous: new Int8Array(64), weights: makeWeights() };
+
+function makeWeights() {
+  return Int8Array.from({ length: 64 }, (_, index) => {
+    const code = (index * 7 + 3) % 3;
+    return code === 0 ? -1 : code === 1 ? 0 : 1;
+  });
+}
+function setStatus(kind, title, copy) {
+  badge.className = `badge ${kind}`;
+  badge.textContent = title;
+  statusCopy.textContent = copy;
+}
+async function loadRuntime() {
+  if (app.runtime) return app.runtime;
+  setStatus('busy', 'LOADING', 'Fetching the Solo WebAssembly module…');
+  const response = await fetch(new URL('./wasm_verifier.wasm', import.meta.url));
+  if (!response.ok) throw new Error(`Wasm fetch failed: ${response.status}`);
+  let loaded;
+  try { loaded = await WebAssembly.instantiateStreaming(response.clone(), {}); }
+  catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    loaded = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+  }
+  const { memory, neur_alloc, neur_solo } = loaded.instance.exports;
+  if (![memory, neur_alloc, neur_solo].every(Boolean)) throw new Error('Missing neur_solo Wasm export; rebuild tools/wasm_verifier.');
+  const alloc = (bytes, alignment) => {
+    const pointer = neur_alloc(bytes, alignment) >>> 0;
+    if (!pointer) throw new Error(`Wasm allocation failed (${bytes} bytes).`);
+    return pointer;
+  };
+  const pointers = { input: alloc(64, 16), weights: alloc(64, 16), output: alloc(4, 4) };
+  new Int8Array(memory.buffer, pointers.weights, 64).set(app.weights);
+  app.runtime = { memory, neur_solo, pointers };
+  return app.runtime;
+}
+function scalarReference(weights, input) {
+  let accumulator = 0;
+  for (let index = 0; index < 64; index++) accumulator += weights[index] * input[index];
+  return (accumulator > 0) - (accumulator < 0);
+}
+function wasmInfer(runtime, input, repeats = 1) {
+  const { memory, pointers, neur_solo } = runtime;
+  new Int8Array(memory.buffer, pointers.input, 64).set(input);
+  const output = new Int32Array(memory.buffer, pointers.output, 1);
+  let status = 0;
+  const start = performance.now();
+  for (let repeat = 0; repeat < repeats; repeat++) {
+    status = neur_solo(pointers.input, pointers.weights, pointers.output);
+    if (status !== 0) throw new Error(`neur_solo returned status ${status}`);
+  }
+  return { value: output[0], averageUs: ((performance.now() - start) * 1000) / repeats };
+}
+function renderInput(input) {
+  const fragment = document.createDocumentFragment();
+  for (let index = 0; index < 64; index++) {
+    const cell = document.createElement('div');
+    cell.className = `byte${input[index] !== app.previous[index] ? ' changed' : ''}`;
+    cell.title = `input[${index}] = ${input[index]}`;
+    cell.innerHTML = `<small>${String(index).padStart(2, '0')}</small>${input[index]}`;
+    fragment.append(cell);
+  }
+  $('#input').replaceChildren(fragment);
+  app.previous.set(input);
+}
+function renderDecision(value) {
+  const element = $('#decision');
+  element.textContent = value > 0 ? '+1' : value < 0 ? '−1' : '0';
+  element.className = `decision-value ${value > 0 ? 'positive' : value < 0 ? 'negative' : 'zero'}`;
+  $('#decision-copy').textContent = value > 0 ? 'Positive · accumulator > 0' : value < 0 ? 'Negative · accumulator < 0' : 'Neutral · accumulator is zero';
+}
+function renderRows(results) {
+  const fragment = document.createDocumentFragment();
+  let exact = 0;
+  for (const result of results) {
+    const delta = result.wasm - result.reference;
+    if (delta === 0) exact++;
+    const row = document.createElement('tr');
+    row.innerHTML = `<td>${result.name}</td><td>${result.reference}</td><td>${result.wasm}</td><td class="${delta === 0 ? 'delta-zero' : 'delta-bad'}">${delta > 0 ? '+' : ''}${delta}</td><td class="${delta === 0 ? 'delta-zero' : 'delta-bad'}">${delta === 0 ? 'EXACT' : 'MISMATCH'}</td>`;
+    fragment.append(row);
+  }
+  $('#rows').replaceChildren(fragment);
+  $('#exact').textContent = exact;
+  $('#suite').replaceChildren(...results.map((result) => {
+    const line = document.createElement('div');
+    line.className = 'suite-row';
+    line.innerHTML = `<span>${result.name}</span><strong>${result.wasm === result.reference ? 'Δ 0 · PASS' : 'FAIL'}</strong>`;
+    return line;
+  }));
+  return exact;
+}
+function fixedCases() {
+  const zero = new Int8Array(64);
+  const positive = new Int8Array(64).fill(1);
+  const negative = new Int8Array(64).fill(-1);
+  const extremes = Int8Array.from({ length: 64 }, (_, index) => index & 1 ? 127 : -128);
+  const pattern = Int8Array.from({ length: 64 }, (_, index) => (index * 73 + 19) << 24 >> 24);
+  return [
+    { name: 'All zero', input: zero },
+    { name: 'Uniform positive', input: positive },
+    { name: 'Uniform negative', input: negative },
+    { name: 'Signed-byte extremes', input: extremes },
+    { name: 'Deterministic pattern', input: pattern },
+  ];
+}
+async function runSuite() {
+  const runtime = await loadRuntime();
+  const results = fixedCases().map(({ name, input }) => {
+    const reference = scalarReference(app.weights, input);
+    const { value: wasm } = wasmInfer(runtime, input, 64);
+    return { name, input, reference, wasm };
+  });
+  const exact = renderRows(results);
+  const selected = results[4];
+  const { averageUs } = wasmInfer(runtime, selected.input, 128);
+  $('#latency').textContent = averageUs.toFixed(3);
+  renderInput(selected.input);
+  renderDecision(selected.wasm);
+  setStatus(exact === results.length ? 'pass' : 'fail', exact === results.length ? 'SUITE PASS' : 'SUITE FAIL', `${exact}/${results.length} scalar decisions match; all matching deltas are zero.`);
+}
+async function randomize() {
+  const runtime = await loadRuntime();
+  const bytes = crypto.getRandomValues(new Uint8Array(64));
+  const input = Int8Array.from(bytes, (value) => value > 127 ? value - 256 : value);
+  const reference = scalarReference(app.weights, input);
+  const { value, averageUs } = wasmInfer(runtime, input, 128);
+  const exact = renderRows([{ name: 'Random input', input, reference, wasm: value }]);
+  $('#latency').textContent = averageUs.toFixed(3);
+  renderInput(input);
+  renderDecision(value);
+  setStatus(exact === 1 ? 'pass' : 'fail', exact === 1 ? 'Δ 0 · EXACT' : 'MISMATCH', exact === 1 ? 'Wasm scalar matches the integer reference.' : 'Wasm scalar differs from the reference.');
+}
+async function runAction(action) {
+  runButton.disabled = randomButton.disabled = true;
+  try { await action(); }
+  catch (error) { setStatus('fail', 'ERROR', error?.message ?? String(error)); }
+  finally { runButton.disabled = randomButton.disabled = false; }
+}
+runButton.addEventListener('click', () => runAction(runSuite));
+randomButton.addEventListener('click', () => runAction(randomize));
+renderInput(new Int8Array(64));
+renderDecision(0);
+</script>
+</body>
+</html>
