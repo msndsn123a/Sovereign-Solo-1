@@ -35,6 +35,14 @@ Signed NEUR v2 shards are authenticated and validated before projection to the S
 - **Branchless decision:** sign extraction uses comparison-to-integer arithmetic to produce `-1/0/+1` without conditional branches. CPUs without available AVX2/YMM state use the scalar `infer_scalar` fallback.
 - **Cache behavior:** weights are aligned to a 64-byte cache line and the loader warms the model data. This favors cache residency; ordinary cache placement is not a guarantee that a line remains pinned in L1.
 
+## Latency Profiling: Bare-Metal RDTSC vs. WebAssembly
+
+The appliance's RDTSC microbenchmark observes the hardware time-stamp counter around repeated Solo calls and reports cycles per inference. The observed 13–14 cycle minimum corresponds to roughly 4.3–4.7 ns when interpreted at a 3.0 GHz TSC. RDTSC provides hardware counter ticks without browser timer quantization, although serialization, harness work, CPU frequency behavior, virtualization, and firmware still affect measurements.
+
+The browser verifier uses `performance.now()`, which is deliberately quantized or coarsened by browser privacy and side-channel mitigations. A short isolated call may therefore display as `0.00 µs`, or jump in timer steps such as `0.781 µs`; that is the clock's resolution, not proof that the code took no time. The verifier batches **10,000 Wasm calls**, converts the elapsed milliseconds to nanoseconds per call, and reports the batch average to reduce timer quantization error.
+
+The browser figure measures the Wasm scalar reference plus browser scheduling and JS/Wasm boundary overhead. Batching makes that average more readable, but it does **not** turn the Wasm implementation into the AVX2 inline-assembly appliance kernel or establish a sub-10 ns bare-metal timing result. Use the serialized RDTSC host test for the kernel cycle measurement; treat both values as measurements tied to their respective environments.
+
 ## Bare-Metal Silicon and Appliance Foundation
 
 The inference kernel runs within a fixed-storage UEFI application. The appliance foundation includes:

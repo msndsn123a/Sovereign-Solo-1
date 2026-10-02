@@ -96,7 +96,7 @@
   <div class="status"><span id="badge" class="badge">READY</span><span id="status-copy" class="status-copy">Load the standalone Wasm kernel to begin.</span></div>
 
   <section class="metrics" aria-label="Verifier metrics">
-    <div class="metric"><div class="metric-label">Wasm call average</div><div class="metric-value"><span id="latency">—</span> <small>µs</small></div></div>
+    <div class="metric"><div class="metric-label">Wasm scalar pass · 10k average</div><div class="metric-value"><span id="latency">—</span> <small>ns</small></div></div>
     <div class="metric"><div class="metric-label">Exact test cases</div><div class="metric-value"><span id="exact">—</span> <small>/ 5</small></div></div>
     <div class="metric"><div class="metric-label">Output domain</div><div class="metric-value">−1 · 0 · +1</div></div>
   </section>
@@ -120,8 +120,13 @@
     <div class="heading"><div><h2>Scalar parity verification</h2><p class="sub">Independent reference vs Wasm · Δ = Wasm − reference</p></div><span class="mono-label">ONE OUTPUT<br>BIT-EXACT</span></div>
     <div class="table-wrap"><table aria-label="Solo scalar parity table"><thead><tr><th>Input case</th><th>Reference</th><th>Wasm</th><th>Δ</th><th>Result</th></tr></thead><tbody id="rows"><tr><td colspan="5" style="text-align:center;color:#8298b2;padding:20px">Run the parity suite.</td></tr></tbody></table></div>
     <div id="suite" class="suite" aria-live="polite"></div>
-    <p class="note">Wasm timing includes browser and JS/Wasm boundary overhead; it is not a bare-metal latency measurement. The appliance kernel uses AVX2 inline assembly with a scalar fallback. No recurrent state or floating-point inference is involved.</p>
   </section>
+
+  <aside class="panel" aria-labelledby="execution-context-title">
+    <div class="heading"><div><h2 id="execution-context-title">Execution Context</h2><p class="sub">Browser timer resolution versus bare-metal cycle timing</p></div></div>
+    <p class="note">Note: Modern browsers quantize performance.now() (commonly in 0.781 µs steps) to prevent timing attacks. Benchmarks are averaged across 10,000 passes to extract the sub-10ns single-pass execution profile.</p>
+    <p class="note">The displayed value is the 10,000-call WebAssembly batch duration, converted from milliseconds to nanoseconds per call. It includes browser scheduling and the JS/Wasm boundary; it is not a direct measurement of the bare-metal AVX2 kernel. For that path, use the appliance's serialized RDTSC benchmark.</p>
+  </aside>
 </main>
 <script type="module">
 const $ = (selector) => document.querySelector(selector);
@@ -129,6 +134,7 @@ const runButton = $('#run-suite');
 const randomButton = $('#random-infer');
 const badge = $('#badge');
 const statusCopy = $('#status-copy');
+const BENCHMARK_ITERATIONS = 10_000;
 const app = { runtime: null, previous: new Int8Array(64), weights: makeWeights() };
 
 function makeWeights() {
@@ -180,7 +186,8 @@ function wasmInfer(runtime, input, repeats = 1) {
     status = neur_solo(pointers.input, pointers.weights, pointers.output);
     if (status !== 0) throw new Error(`neur_solo returned status ${status}`);
   }
-  return { value: output[0], averageUs: ((performance.now() - start) * 1000) / repeats };
+  const totalTimeMs = performance.now() - start;
+  return { value: output[0], averageNs: (totalTimeMs * 1_000_000) / repeats };
 }
 function renderInput(input) {
   const fragment = document.createDocumentFragment();
@@ -243,8 +250,8 @@ async function runSuite() {
   });
   const exact = renderRows(results);
   const selected = results[4];
-  const { averageUs } = wasmInfer(runtime, selected.input, 128);
-  $('#latency').textContent = averageUs.toFixed(3);
+  const { averageNs } = wasmInfer(runtime, selected.input, BENCHMARK_ITERATIONS);
+  $('#latency').textContent = averageNs.toFixed(2);
   renderInput(selected.input);
   renderDecision(selected.wasm);
   setStatus(exact === results.length ? 'pass' : 'fail', exact === results.length ? 'SUITE PASS' : 'SUITE FAIL', `${exact}/${results.length} scalar decisions match; all matching deltas are zero.`);
@@ -254,9 +261,9 @@ async function randomize() {
   const bytes = crypto.getRandomValues(new Uint8Array(64));
   const input = Int8Array.from(bytes, (value) => value > 127 ? value - 256 : value);
   const reference = scalarReference(app.weights, input);
-  const { value, averageUs } = wasmInfer(runtime, input, 128);
+  const { value, averageNs } = wasmInfer(runtime, input, BENCHMARK_ITERATIONS);
   const exact = renderRows([{ name: 'Random input', input, reference, wasm: value }]);
-  $('#latency').textContent = averageUs.toFixed(3);
+  $('#latency').textContent = averageNs.toFixed(2);
   renderInput(input);
   renderDecision(value);
   setStatus(exact === 1 ? 'pass' : 'fail', exact === 1 ? 'Δ 0 · EXACT' : 'MISMATCH', exact === 1 ? 'Wasm scalar matches the integer reference.' : 'Wasm scalar differs from the reference.');
