@@ -2,10 +2,10 @@
 //!
 //! Encodes and Ed25519-signs ternary model weights into NEUR v2 shards.
 
+use ed25519_dalek::{Signer, SigningKey};
 use std::fs::{create_dir_all, File};
 use std::io::Write;
 use std::path::Path;
-use ed25519_dalek::{Signer, SigningKey};
 
 pub const MAGIC_NEUR: [u8; 4] = *b"NEUR"; // 0x4E455552
 pub const SECTOR_SIZE: usize = 512;
@@ -13,6 +13,7 @@ const ATTENTION_WEIGHT_BYTES: usize = 832;
 const ATTENTION_POT_WEIGHT_BYTES: usize = 1664;
 const MLP_WEIGHT_BYTES: usize = 640;
 const MLP_BLOCK_MASK_BYTES: usize = 48;
+const SOLO_WEIGHT_BYTES: usize = 16;
 const BASE_HEADER_SIZE: usize = 16;
 const SIGNATURE_SIZE: usize = 64;
 const SIGNED_HEADER_SIZE: usize = BASE_HEADER_SIZE + SIGNATURE_SIZE;
@@ -53,6 +54,15 @@ fn sign_unsigned_shard(
         0 => (MLP_WEIGHT_BYTES, "mlp"),
         1 if has_feature_flag => (ATTENTION_POT_WEIGHT_BYTES, "attention"),
         1 => (ATTENTION_WEIGHT_BYTES, "attention"),
+        2 => {
+            if input[8..12] != 64u32.to_le_bytes()
+                || input[13..15] != 1u16.to_le_bytes()
+                || input[15] != 0
+            {
+                return Err("native Solo unsigned metadata must specify input_dim=64, output_dim=1, and zero flags".to_string());
+            }
+            (SOLO_WEIGHT_BYTES, "solo")
+        }
         _ => return Err(format!("unsupported unsigned NEUR model_type={model_type}")),
     };
     if input.len() < BASE_HEADER_SIZE + payload_size {
@@ -95,6 +105,29 @@ pub fn pack_weights_64(weights: &[i8; 64]) -> [u8; 16] {
         byte_idx += 1;
     }
     packed
+}
+
+/// Builds and signs a native Solo shard containing exactly 64 ternary weights.
+pub fn build_solo_shard_sector(
+    version: u32,
+    block_size: usize,
+    weights: &[i8; 64],
+    signing_key: &SigningKey,
+) -> Vec<u8> {
+    assert!((512..=4096).contains(&block_size) && block_size.is_power_of_two());
+    let record_size = SIGNED_HEADER_SIZE + SOLO_WEIGHT_BYTES;
+    let padded_size = record_size.div_ceil(block_size) * block_size;
+    let mut sector = vec![0u8; padded_size];
+
+    sector[0..4].copy_from_slice(&MAGIC_NEUR);
+    sector[4..8].copy_from_slice(&version.to_le_bytes());
+    sector[8..12].copy_from_slice(&64u32.to_le_bytes());
+    sector[12] = 2; // Native Solo model type.
+    sector[13..15].copy_from_slice(&1u16.to_le_bytes());
+    sector[15] = 0; // No hidden dimension or optional format flags.
+    sector[SIGNED_HEADER_SIZE..record_size].copy_from_slice(&pack_weights_64(weights));
+    sign_payload(&mut sector, SOLO_WEIGHT_BYTES, signing_key);
+    sector
 }
 
 /// Builds and signs a 64 -> 32 -> 16 ternary MLP shard.
@@ -257,7 +290,7 @@ pub fn build_pot_attention_shard_sector(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut out_path = "dist/production_shard.bin".to_string();
     let mut block_size = SECTOR_SIZE;
-    let mut model_type = "mlp".to_string();
+    let mut model_type = "solo".to_string();
     let mut variant = "pattern".to_string();
     let mut quantization = "ternary".to_string();
     let mut multi_stream = false;
@@ -355,6 +388,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (signed, detected_model.to_string())
     } else {
         let sector = match model_type.as_str() {
+            "solo"
+                if quantization != "ternary"
+                    || multi_stream
+                    || pot_scale != 0
+                    || prune_blocks
+                    || activation_lut =>
+            {
+                return Err(
+                    "native Solo supports only ternary weights and no optional model flags".into(),
+                )
+            }
+            "solo" => build_solo_shard_sector(VERSION, block_size, &weights, &signing_key),
             "mlp" if variant != "pattern" && variant != "zero" => {
                 return Err("--variant must be pattern or zero".into())
             }
@@ -390,7 +435,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             "attention" => return Err("--quant must be ternary or pot".into()),
             _ => {
-                return Err(format!("unsupported model type: {model_type} (use mlp or attention)").into())
+                return Err(format!(
+                    "unsupported model type: {model_type} (use solo, mlp, or attention)"
+                )
+                .into())
             }
         };
         (sector, model_type)
@@ -419,9 +467,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - Activation LUT:    {}", activation_lut);
     println!(
         "  - Hidden/Attention:   {} elements",
-        if model_type == "attention" { 16 } else { 32 }
+        if model_type == "solo" {
+            0
+        } else if model_type == "attention" {
+            16
+        } else {
+            32
+        }
     );
-    println!("  - Output Dimension:   16 elements");
+    println!(
+        "  - Output Dimension:   {} element(s)",
+        if model_type == "solo" { 1 } else { 16 }
+    );
     println!("  - LBA Block Size:     {} bytes", block_size);
     println!(
         "  - PoT Scale:          {} (signed right-shift metadata)",
@@ -431,7 +488,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "  - Payload Size:       {} bytes (LBA-block padded)",
         sector.len()
     );
-    if model_type == "mlp" {
+    if model_type == "solo" {
+        println!(
+            "  - Native Solo Size:   {} bytes (signed record=96 bytes)",
+            SOLO_WEIGHT_BYTES
+        );
+    } else if model_type == "mlp" {
         println!("  - Layer 1 Size:       512 bytes");
         println!("  - Layer 2 Size:       128 bytes");
         if prune_blocks {
@@ -447,4 +509,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signature, Verifier};
+
+    #[test]
+    fn native_solo_records_are_signed_and_sector_padded() {
+        let signing_key = SigningKey::from_bytes(&TEST_SIGNING_SEED);
+        let mut weights = [0i8; 64];
+        for (index, weight) in weights.iter_mut().enumerate() {
+            *weight = match index % 3 {
+                0 => -1,
+                1 => 0,
+                _ => 1,
+            };
+        }
+        let expected_payload = pack_weights_64(&weights);
+
+        for block_size in [512, 4096] {
+            let shard = build_solo_shard_sector(2, block_size, &weights, &signing_key);
+            assert_eq!(shard.len(), block_size);
+            assert_eq!(&shard[..4], b"NEUR");
+            assert_eq!(&shard[4..8], &2u32.to_le_bytes());
+            assert_eq!(&shard[8..12], &64u32.to_le_bytes());
+            assert_eq!(shard[12], 2);
+            assert_eq!(&shard[13..15], &1u16.to_le_bytes());
+            assert_eq!(shard[15], 0);
+            assert_eq!(
+                &shard[SIGNED_HEADER_SIZE..SIGNED_HEADER_SIZE + SOLO_WEIGHT_BYTES],
+                &expected_payload
+            );
+
+            let mut message = Vec::with_capacity(BASE_HEADER_SIZE + SOLO_WEIGHT_BYTES);
+            message.extend_from_slice(&shard[..BASE_HEADER_SIZE]);
+            message.extend_from_slice(
+                &shard[SIGNED_HEADER_SIZE..SIGNED_HEADER_SIZE + SOLO_WEIGHT_BYTES],
+            );
+            let signature = Signature::from_slice(&shard[BASE_HEADER_SIZE..SIGNED_HEADER_SIZE])
+                .expect("builder emits a 64-byte Ed25519 signature");
+            signing_key
+                .verifying_key()
+                .verify(&message, &signature)
+                .expect("signature covers metadata and the exact Solo payload");
+            assert!(shard[SIGNED_HEADER_SIZE + SOLO_WEIGHT_BYTES..]
+                .iter()
+                .all(|&byte| byte == 0));
+        }
+    }
 }

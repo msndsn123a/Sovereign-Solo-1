@@ -3,7 +3,7 @@ param(
     [ValidateRange(1, 64)][int]$CpuCount = 2,
     [string]$QemuAccel = "",
     [string]$QemuCpu = "Skylake-Server,+avx512f,+avx512dq",
-    [string]$ShardPath = "dist/attention_test_shard.bin",
+    [string]$ShardPath = "dist/solo_wire_test_shard.bin",
     [string]$EfiPath = "target/x86_64-unknown-uefi/release/neural_box_core.efi"
 )
 
@@ -16,8 +16,8 @@ $client = $null
 try {
     cargo +nightly build --target x86_64-unknown-uefi --release
     if ($LASTEXITCODE -ne 0) { throw "UEFI release build failed: $LASTEXITCODE" }
-    & "$PSScriptRoot/payload_builder/build_payload.ps1" -outPath $ShardPath -model attention -quant pot -potScale 0 -multiStream
-    if ($LASTEXITCODE -ne 0) { throw "Attention shard generation failed: $LASTEXITCODE" }
+    & "$PSScriptRoot/payload_builder/build_payload.ps1" -outPath $ShardPath -model solo -variant pattern
+    if ($LASTEXITCODE -ne 0) { throw "Native Solo shard generation failed: $LASTEXITCODE" }
     if (-not (Test-Path $EfiPath)) { throw "UEFI binary not found: $EfiPath" }
 
     New-Item -ItemType Directory -Force -Path "esp/EFI/BOOT", "dist" | Out-Null
@@ -73,67 +73,44 @@ try {
         }
     }
     if (-not $readyFound) { throw "UART_READY handshake was not found" }
-    Write-Host "[ATTENTION TEST]: UART_READY received."
+    Write-Host "[SOLO WIRE TEST]: UART_READY received."
 
-    $script:soloOutput = $null
-    function Send-SoloFrame([byte]$streamId) {
-        $request = New-Object byte[] 67
-        $request[0] = 0x4E
-        $request[1] = 0x53
-        $request[2] = $streamId
-        for ($index = 3; $index -lt $request.Length; $index++) { $request[$index] = 1 }
+    function Send-SoloFrame([int]$frameNumber) {
+        $request = New-Object byte[] 66
+        $request[0] = 0x53
+        $request[1] = 0x4F
+        for ($index = 2; $index -lt $request.Length; $index++) { $request[$index] = 1 }
         $stream.Write($request, 0, $request.Length)
         $stream.Flush()
 
-        $response = New-Object byte[] 7
+        $response = New-Object byte[] 6
         $offset = 0
         while ($offset -lt $response.Length) {
             $count = $stream.Read($response, $offset, $response.Length - $offset)
             if ($count -le 0) { throw "COM2 disconnected before Solo output frame" }
             $offset += $count
         }
-        if ($response[0] -ne 0x4E -or $response[1] -ne 0x52 -or $response[2] -ne 1) {
-            throw "Solo response header mismatch"
+        if ($response[0] -ne 0x53 -or $response[1] -ne 0x52) {
+            throw "Solo response did not contain the SR preamble"
         }
-        $actual = [BitConverter]::ToInt32($response, 3)
-        if ($null -eq $script:soloOutput) {
-            $script:soloOutput = $actual
-        } elseif ($actual -ne $script:soloOutput) {
-            throw "Stateless Solo output changed across calls: first=$script:soloOutput, stream=$streamId, actual=$actual"
+        $actual = [BitConverter]::ToInt32($response, 2)
+        if ($actual -ne 1) {
+            throw "Frame $frameNumber expected scalar +1 for the all-positive input, got $actual"
         }
-        Write-Host "[SOLO STATE TEST]: stream_tag=$streamId output=$actual (identical across calls)"
+        Write-Host "[SOLO WIRE TEST]: frame=$frameNumber ingress=66 bytes response=6 bytes scalar=$actual"
     }
 
-    # Repeated frames with different transport stream tags must not accumulate state.
-    Send-SoloFrame 2
-    Send-SoloFrame 5
-    Send-SoloFrame 5
-    Send-SoloFrame 2
+    for ($frame = 1; $frame -le 8; $frame++) { Send-SoloFrame $frame }
 
-    # Selective NR is accepted as a stateless no-op and keeps the session alive.
-    $targetedReset = [byte[]](0x4E, 0x52, 0x05)
-    $stream.Write($targetedReset, 0, $targetedReset.Length)
-    $stream.Flush()
-    Send-SoloFrame 5
-    Send-SoloFrame 2
-
-    # A standalone NR remains the legacy stream-0 reset/exit control.
-    $reset = [byte[]](0x4E, 0x52)
-    $stream.Write($reset, 0, $reset.Length)
-    $stream.Flush()
-    Write-Host "[SOLO STATE TEST]: sent stateless NR+5 control and standalone NR exit."
-
-    if (-not $qemuProcess.WaitForExit(15000)) { throw "QEMU did not exit after the NR reset event" }
+    if (-not $qemuProcess.WaitForExit(15000)) { throw "QEMU did not exit after eight SO frames" }
     if ($qemuProcess.ExitCode -ne 0) { throw "QEMU exited with code $($qemuProcess.ExitCode)" }
 
     $expectedAps = $CpuCount - 1
     $required = @(
-        "\[SHARD\]: .*MODEL_TYPE=1.*OUTPUT_DIM=16",
-        "\[SHARD CONFIG\]: multi_stream=true, quant_type=1, pot_scale=0, block_sparse=false, activation_lut=false",
+        "\[SHARD\]: .*MODEL_TYPE=2.*OUTPUT_DIM=1",
         "\[SMP\]: $expectedAps/$expectedAps Application Processors awakened and parked",
-        "\[SOLO MODEL\]: authenticated shard retained; projection=row 0, output_dim=1, recurrent_state=disabled",
-        "\[SOLO CONTROL\]: command=NR reset_count=1 stream=5 stateless=true",
-        "\[UART\]: RX frames=6, TX frames=6, reset_commands=2, stream_events=8, ring_full_drops=0"
+        "\[SOLO MODEL\]: authenticated native Solo payload ingested directly; output_dim=1, recurrent_state=disabled",
+        "\[UART\]: RX frames=8, TX frames=8, update_commands=0, ring_full_drops=0"
     )
     $matched = Select-String -Path $serialLog -Pattern $required
     $matched | ForEach-Object { Write-Host $_.Line }
@@ -142,7 +119,7 @@ try {
             throw "COM1 log did not contain required verification pattern: $pattern"
         }
     }
-    Write-Host "[SOLO STATE TEST]: PASS; repeated inference remained identical across stream tags and reset controls, with $CpuCount-CPU appliance execution clean."
+    Write-Host "[SOLO WIRE TEST]: PASS; eight 66-byte SO requests received valid six-byte SR scalar responses on the $CpuCount-CPU appliance."
 } finally {
     if ($client) { $client.Dispose() }
     if ($qemuProcess -and -not $qemuProcess.HasExited) {

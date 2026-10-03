@@ -16,13 +16,13 @@ try {
     & $Python ml/train_pure_mlp.py --checkpoint dist/pure_mlp_qat.pt --metrics dist/pure_mlp_qat_metrics.json
     if ($LASTEXITCODE -ne 0) { throw "PyTorch QAT training failed with exit code $LASTEXITCODE" }
 
-    & $Python ml/export_pure_shard.py --checkpoint dist/pure_mlp_qat.pt --output dist/trained_pure_mlp_shard.bin --expected dist/trained_pure_mlp_expected.json --block-size $BlockSize
+    & $Python ml/export_pure_shard.py --checkpoint dist/pure_mlp_qat.pt --output dist/trained_pure_solo_shard.bin --expected dist/trained_pure_solo_expected.json --block-size $BlockSize
     if ($LASTEXITCODE -ne 0) { throw "NEUR shard export failed with exit code $LASTEXITCODE" }
 
     cargo +nightly build --target x86_64-unknown-uefi --release
     if ($LASTEXITCODE -ne 0) { throw "UEFI release build failed with exit code $LASTEXITCODE" }
 
-    & .\tools\test_uart_roundtrip.ps1 -Port $Port -QemuAccel $QemuAccel -ShardPath dist/trained_pure_mlp_shard.bin -ExpectedPath dist/trained_pure_mlp_expected.json
+    & .\tools\test_uart_roundtrip.ps1 -Port $Port -QemuAccel $QemuAccel -ShardPath dist/trained_pure_solo_shard.bin -ExpectedPath dist/trained_pure_solo_expected.json
     if ($LASTEXITCODE -ne 0) { throw "QEMU trained-shard verification failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location

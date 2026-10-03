@@ -2,7 +2,6 @@ param(
     [int]$Port = 5570,
     [ValidateRange(1, 64)][int]$CpuCount = 1,
     [switch]$TamperWeights,
-    [switch]$RequireSparseActivation,
     [string]$QemuAccel = "",
     [string]$QemuCpu = "Skylake-Server,+avx512f,+avx512dq",
     [string]$ImagePath = "dist/neural_box_appliance.img"
@@ -34,16 +33,8 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "Tampered image packaging failed: $LASTEXITCODE" }
         Write-Host "[SECURITY TEST]: Mutated payload byte; boot must reject the shard signature."
     }
-    if ($TamperWeights -and $RequireSparseActivation) {
-        throw "Sparse activation validation cannot be combined with the tamper test"
-    }
-
     $qemu = (Get-Command qemu-system-x86_64 -ErrorAction Stop).Source
-    $serialLog = if ($RequireSparseActivation) {
-        "dist/qemu-dual-volume-sparse-com1.log"
-    } else {
-        "dist/qemu-dual-volume-com1.log"
-    }
+    $serialLog = "dist/qemu-dual-volume-com1.log"
     $qemuArgs = @(
         "-bios", "assets/OVMF.fd",
         "-drive", "file=$ImagePath,if=none,id=nvm1,format=raw",
@@ -96,20 +87,20 @@ try {
 
     for ($frame = 1; $frame -le 8; $frame++) {
         $request = New-Object byte[] 66
-        $request[0] = 0x4E
-        $request[1] = 0x42
+        $request[0] = 0x53
+        $request[1] = 0x4F
         $stream.Write($request, 0, $request.Length)
         $stream.Flush()
 
-        $response = New-Object byte[] 7
+        $response = New-Object byte[] 6
         $offset = 0
         while ($offset -lt $response.Length) {
             $count = $stream.Read($response, $offset, $response.Length - $offset)
             if ($count -le 0) { throw "COM2 disconnected before response frame $frame" }
             $offset += $count
         }
-        if ($response[0] -ne 0x4E -or $response[1] -ne 0x52 -or $response[2] -ne 1) {
-            throw "Response frame $frame did not contain NR + output_dim=1"
+        if ($response[0] -ne 0x53 -or $response[1] -ne 0x52) {
+            throw "Response frame $frame did not contain the SR preamble"
         }
         if ([BitConverter]::ToInt32($response, 3) -ne 0) {
             throw "Solo projection expected zero output for zero input (frame $frame)"
@@ -122,14 +113,14 @@ try {
 
     $expectedAps = $CpuCount - 1
     $required = @(
-        "\[LOADER\]: Read weights.bin from UEFI SimpleFileSystem \(1024 bytes\)",
+        "\[LOADER\]: Read weights.bin from UEFI SimpleFileSystem \(512 bytes\)",
         "\[SECURITY (TME|SME|MEM)\]:",
         "\[SECURITY GATE\]: strict_memory_encryption=false, policy_satisfied=(true|false)",
         "\[PAGING\]: Custom CR3 activated .*encrypted huge pages=[0-9]+, C-bit mask=0x[0-9a-fA-F]{16}",
         "\[SMP\]: $expectedAps/$expectedAps Application Processors awakened and parked",
         "\[WATCHDOG\]: WDAT unavailable; safe no-op fallback \(no chipset TCO base guessed\)\.",
         "\[TOPOLOGY\]: Uniform/Symmetric",
-        "\[UART\]: RX frames=8, TX frames=8, reset_commands=0, stream_events=8, ring_full_drops=0"
+        "\[UART\]: RX frames=8, TX frames=8, update_commands=0, ring_full_drops=0"
     )
     if ($CpuCount -gt 1) {
         $required += "\[TOPOLOGY AUX VERIFY\]: APIC ID=[0-9]+, ring_samples=[1-9][0-9]*, queue_depth=[0-9]+"
@@ -141,18 +132,12 @@ try {
         )
     } else {
         $required += @(
-            "\[LOADER\]: Validated file shard from UEFI FAT volume \(1024 bytes\)",
+            "\[LOADER\]: Validated file shard from UEFI FAT volume \(512 bytes\)",
             "\[LOADER\]: Using model shard from UEFI FAT filesystem",
             "\[SECURITY\]: Shard signature valid \(Ed25519 verified\)",
-            "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=0"
+            "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=2, HIDDEN_OR_ATTN_DIM=0, OUTPUT_DIM=1",
+            "\[SOLO MODEL\]: authenticated native Solo payload ingested directly; output_dim=1, recurrent_state=disabled"
         )
-        if ($RequireSparseActivation) {
-            $required += @(
-                "\[SHARD CONFIG\]: multi_stream=false, quant_type=0, pot_scale=0, block_sparse=true, activation_lut=true",
-                "\[SOLO MODEL\]: authenticated shard retained; projection=row 0, output_dim=1, recurrent_state=disabled",
-                "\[SOLO KERNEL\]: predecoded ternary coefficients=64, scalar action values=-1/0/1, avx2=(true|false)"
-            )
-        }
     }
     $telemetry = Select-String -Path $serialLog -Pattern $required
     $telemetry | ForEach-Object { Write-Host $_.Line }
@@ -176,11 +161,7 @@ try {
         }
         Write-Host "[SECURITY TEST]: PASS; mutated shard rejected and safe identity fallback completed with zero drops."
     } else {
-        if ($RequireSparseActivation) {
-            Write-Host "[DUAL VOLUME TEST]: PASS; sparse blocks skipped, LUT activation warmed and evaluated, dense/sparse parity verified, streaming completed with zero drops."
-        } else {
-            Write-Host "[DUAL VOLUME TEST]: PASS; signed weights.bin authenticated through UEFI SimpleFileSystem and streaming completed with zero drops."
-        }
+        Write-Host "[DUAL VOLUME TEST]: PASS; signed native Solo weights.bin authenticated through UEFI SimpleFileSystem and SO/SR streaming completed with zero drops."
     }
 } finally {
     if ($client) { $client.Dispose() }

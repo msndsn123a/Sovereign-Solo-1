@@ -14,6 +14,7 @@ pub const NEUR_SIGNING_PUBLIC_KEY: [u8; 32] = [
 
 const MAX_NEUR_PAYLOAD_SIZE: usize = 1664;
 const BASE_HEADER_SIZE: usize = 16;
+pub const SOLO_PAYLOAD_SIZE: usize = 16;
 
 /// Verify Ed25519 over `metadata_prefix || payload`, excluding the signature field.
 ///
@@ -45,4 +46,17 @@ pub fn verify_neur_signature(
     verifying_key
         .verify_strict(&message[..BASE_HEADER_SIZE + payload.len()], &signature)
         .is_ok()
+}
+
+/// Verify an Ed25519-signed native Solo shard payload.
+///
+/// Native Solo records contain exactly 64 packed ternary weights (16 bytes).
+/// The signed message is the 16-byte metadata prefix followed by this payload.
+pub fn verify_solo_neur_signature(
+    metadata_prefix: &[u8],
+    signature_bytes: &[u8],
+    payload: &[u8],
+) -> bool {
+    payload.len() == SOLO_PAYLOAD_SIZE
+        && verify_neur_signature(metadata_prefix, signature_bytes, payload)
 }

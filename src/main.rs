@@ -58,17 +58,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 use uefi::prelude::*;
 
 use crate::bitpack::{
-    parse_neur_header, validate_pot_payload, validate_ternary_payload, NeurHeader, NeurHeaderError,
-    NEUR_ATTENTION_PAYLOAD_BYTES, NEUR_ATTENTION_POT_PAYLOAD_BYTES, NEUR_BASE_HEADER_SIZE,
-    NEUR_HEADER_SIZE, NEUR_MAGIC, NEUR_MLP_PAYLOAD_BYTES, NEUR_MLP_SPARSE_PAYLOAD_BYTES,
-    NEUR_MODEL_CAUSAL_LINEAR_ATTENTION, NEUR_MODEL_MLP, NEUR_QUANT_POT,
+    parse_neur_header, validate_ternary_payload, NeurHeader, NeurHeaderError,
+    NEUR_BASE_HEADER_SIZE, NEUR_HEADER_SIZE, NEUR_MAGIC, NEUR_MODEL_SOLO,
+    NEUR_SOLO_OUTPUT_DIM, NEUR_SOLO_PAYLOAD_BYTES,
 };
 use crate::boot::{establish_cpu_sovereignty, exit_uefi_boot_services, hardware_shutdown};
 use crate::io_ring::{InputFrame, InputRing, OutputFrame, OutputRing};
 use crate::kernel::{
-    enable_avx512_os_state, infer_avx2, infer_scalar, software_prefetch_warm,
-    PotLinearAttention, SparseTernaryMlp64x32x16, TernaryLinearAttention, TernaryMlp64x32x16,
-    TernaryWeights64,
+    enable_avx512_os_state, infer_avx2, infer_scalar, software_prefetch_warm, TernaryWeights64,
 };
 use crate::timer::{
     cycles_for_seconds, cycles_to_micros_milli, read_tsc, summarize, LatencySample, LatencySummary,
@@ -182,45 +179,28 @@ fn model_weight_buffer_ptr(index: usize) -> *mut WeightBuffer {
     }
 }
 
-fn infer_values(
-    inputs: &[i8; 64],
-    model: &LoadedModel,
-    avx2_enabled: bool,
-    outputs: &mut [i32; 64],
-) -> u8 {
-    outputs[0] = if avx2_enabled {
+fn infer_one(inputs: &[i8; 64], model: &LoadedModel, avx2_enabled: bool) -> i32 {
+    if avx2_enabled {
         unsafe { infer_avx2(&model.solo_weights, inputs) }
     } else {
         infer_scalar(&model.solo_weights, inputs)
-    };
-    1
+    }
 }
 
-fn infer_frame(
-    frame: InputFrame,
-    model: &LoadedModel,
-    avx2_enabled: bool,
-) -> OutputFrame {
+fn infer_frame(frame: InputFrame, model: &LoadedModel, avx2_enabled: bool) -> OutputFrame {
     let mut output = OutputFrame {
-        output_dim: 0,
-        values: [0; 64],
+        value: infer_one(&frame.payload, model, avx2_enabled),
         t0_preamble: frame.t0_preamble,
         t1_ingress: frame.t1_ingress,
         t2_compute: 0,
     };
-    output.output_dim = infer_values(&frame.payload, model, avx2_enabled, &mut output.values);
     output.t2_compute = unsafe { timer::read_tsc_with_aux() }.0;
     output
 }
 
 unsafe fn transmit_output_frame(frame: &OutputFrame) -> u64 {
-    serial::write_raw_bytes_from(serial::COM2_BASE, &serial::OUTPUT_PREAMBLE);
-    serial::write_byte_raw_from(serial::COM2_BASE, frame.output_dim);
-    let mut index = 0usize;
-    while index < frame.output_dim as usize {
-        serial::write_raw_bytes_from(serial::COM2_BASE, &frame.values[index].to_le_bytes());
-        index += 1;
-    }
+    let wire_frame = serial::encode_response_frame(frame.value);
+    serial::write_raw_bytes_from(serial::COM2_BASE, &wire_frame);
     timer::read_tsc_with_aux().0
 }
 
@@ -292,16 +272,11 @@ fn verify_shared_mailbox(
         };
         let t1_ingest = unsafe { read_tsc() };
         let published = mailbox.compute_and_publish_output(
-            1,
             t0_observed,
             t1_ingest,
-            |output_values| {
+            |output_value| {
                 let input = unsafe { input_slot.payload() };
-                output_values[0] = if avx2_enabled {
-                    unsafe { infer_avx2(&model.solo_weights, input) }
-                } else {
-                    infer_scalar(&model.solo_weights, input)
-                };
+                *output_value = infer_one(input, model, avx2_enabled);
                 unsafe { read_tsc() }
             },
         );
@@ -314,23 +289,14 @@ fn verify_shared_mailbox(
             }
         };
 
-        let (_, output_values, actual_dim) = match mailbox.consume_output() {
+        let (_, output_value) = match mailbox.consume_output() {
             Some(output) => output,
             None => {
                 dropped += 1;
                 continue;
             }
         };
-        if actual_dim != 1 {
-            return false;
-        }
-
-        let expected = if avx2_enabled {
-            unsafe { infer_avx2(&model.solo_weights, &test_payload) }
-        } else {
-            infer_scalar(&model.solo_weights, &test_payload)
-        };
-        if output_values[0] != expected {
+        if output_value != infer_one(&test_payload, model, avx2_enabled) {
             return false;
         }
 
@@ -355,7 +321,7 @@ fn verify_shared_mailbox(
     let sub_microsecond =
         timer::tsc_frequency_hz() != 0 && summary.max < (timer::tsc_frequency_hz() / 1_000_000);
     serial_println!(
-        "[SOLO VERIFY]: output_dim=1; frames={}, drops={}, scalar_reference=match, max_below_1us={}",
+        "[SOLO VERIFY]: scalar mailbox parity=match; frames={}, drops={}, max_below_1us={}",
         completed,
         dropped,
         sub_microsecond
@@ -372,91 +338,36 @@ enum ShardLoadError {
     ReadFailed,
 }
 
-fn neur_payload_size(header: &NeurHeader) -> Result<usize, ShardLoadError> {
-    match (header.model_type, header.quant_type) {
-        (NEUR_MODEL_MLP, 0) if header.block_sparse => Ok(NEUR_MLP_SPARSE_PAYLOAD_BYTES),
-        (NEUR_MODEL_MLP, 0) => Ok(NEUR_MLP_PAYLOAD_BYTES),
-        (NEUR_MODEL_CAUSAL_LINEAR_ATTENTION, 0) => Ok(NEUR_ATTENTION_PAYLOAD_BYTES),
-        (NEUR_MODEL_CAUSAL_LINEAR_ATTENTION, NEUR_QUANT_POT) => {
-            Ok(NEUR_ATTENTION_POT_PAYLOAD_BYTES)
-        }
-        _ => Err(ShardLoadError::InvalidPayload),
-    }
-}
-
-fn pot_query_row_to_solo(row: &[u8; 32]) -> TernaryWeights64 {
-    let mut packed = [0u8; 16];
-    let mut index = 0usize;
-    while index < 64 {
-        let byte = row[index >> 1];
-        let code = if index & 1 == 0 { byte & 0x0F } else { byte >> 4 };
-        let ternary = if code == 0 || code == 8 {
-            0
-        } else if code < 8 {
-            1
-        } else {
-            3
-        };
-        packed[index >> 2] |= ternary << ((index & 3) * 2);
-        index += 1;
-    }
-    TernaryWeights64::from_packed(&packed)
-}
-
 fn parse_neur_shard(data: &[u8]) -> Result<(LoadedModel, NeurHeader), ShardLoadError> {
     let header = parse_neur_header(data).map_err(ShardLoadError::InvalidHeader)?;
-    if header.version != 2 || data.len() < NEUR_HEADER_SIZE {
-        return Err(ShardLoadError::SignatureMismatch);
+    if header.version != 2
+        || header.model_type != NEUR_MODEL_SOLO
+        || header.input_dim != 64
+        || header.output_dim != NEUR_SOLO_OUTPUT_DIM
+        || header.quant_type != 0
+        || data.len() < NEUR_HEADER_SIZE
+    {
+        return Err(ShardLoadError::InvalidPayload);
     }
-    let payload_size = neur_payload_size(&header)?;
-    let payload_end = NEUR_HEADER_SIZE + payload_size;
+    let payload_end = NEUR_HEADER_SIZE + NEUR_SOLO_PAYLOAD_BYTES;
     if payload_end > data.len() || payload_end > nvme::DMA_PAGE_SIZE {
         return Err(ShardLoadError::InvalidPayload);
     }
     let payload = &data[NEUR_HEADER_SIZE..payload_end];
-    if !crypto::verify_neur_signature(
+    if !crypto::verify_solo_neur_signature(
         &data[..NEUR_BASE_HEADER_SIZE],
         &data[NEUR_BASE_HEADER_SIZE..NEUR_HEADER_SIZE],
         payload,
     ) {
         return Err(ShardLoadError::SignatureMismatch);
     }
-    let valid_payload = if header.quant_type == NEUR_QUANT_POT {
-        validate_pot_payload(payload)
-    } else if header.block_sparse {
-        validate_ternary_payload(&payload[..NEUR_MLP_PAYLOAD_BYTES])
-    } else {
-        validate_ternary_payload(payload)
-    };
-    if !valid_payload {
+    if !validate_ternary_payload(payload) {
         return Err(ShardLoadError::InvalidPayload);
     }
-
-    // Keep the existing signed shard formats and validation, but project each
-    // format once to its first 64-input row for stateless Solo inference.
-    let solo_weights = match (header.model_type, header.quant_type) {
-        (NEUR_MODEL_MLP, _) if header.block_sparse => {
-            let sparse = SparseTernaryMlp64x32x16::from_packed_payload(payload)
-                .ok_or(ShardLoadError::InvalidPayload)?;
-            TernaryWeights64::from_packed(&sparse.weights.layer1[0])
-        }
-        (NEUR_MODEL_MLP, _) => {
-            let mlp = TernaryMlp64x32x16::from_packed_payload(payload)
-                .ok_or(ShardLoadError::InvalidPayload)?;
-            TernaryWeights64::from_packed(&mlp.layer1[0])
-        }
-        (NEUR_MODEL_CAUSAL_LINEAR_ATTENTION, NEUR_QUANT_POT) => {
-            let attention = PotLinearAttention::from_packed_payload(payload, header.pot_scale)
-                .ok_or(ShardLoadError::InvalidPayload)?;
-            pot_query_row_to_solo(&attention.q[0])
-        }
-        (NEUR_MODEL_CAUSAL_LINEAR_ATTENTION, _) => {
-            let attention = TernaryLinearAttention::from_packed_payload(payload)
-                .ok_or(ShardLoadError::InvalidPayload)?;
-            TernaryWeights64::from_packed(&attention.q[0])
-        }
-        _ => return Err(ShardLoadError::InvalidPayload),
-    };
+    let packed: &[u8; NEUR_SOLO_PAYLOAD_BYTES] = payload
+        .try_into()
+        .map_err(|_| ShardLoadError::InvalidPayload)?;
+    let solo_weights = TernaryWeights64::from_packed(packed);
     Ok((LoadedModel { solo_weights }, header))
 }
 
@@ -494,8 +405,14 @@ unsafe fn load_neur_shard(
     let lba = selected_lba.ok_or(ShardLoadError::NotFound)?;
     let header = parse_neur_header(&buffer.0[..logical_block_size])
         .map_err(ShardLoadError::InvalidHeader)?;
-    let payload_size = neur_payload_size(&header)?;
-    let payload_end = NEUR_HEADER_SIZE + payload_size;
+    if header.model_type != NEUR_MODEL_SOLO
+        || header.input_dim != 64
+        || header.output_dim != NEUR_SOLO_OUTPUT_DIM
+        || header.quant_type != 0
+    {
+        return Err(ShardLoadError::InvalidPayload);
+    }
+    let payload_end = NEUR_HEADER_SIZE + NEUR_SOLO_PAYLOAD_BYTES;
     if payload_end > nvme::DMA_PAGE_SIZE {
         return Err(ShardLoadError::InvalidPayload);
     }
@@ -566,11 +483,14 @@ unsafe fn update_model_from_raw_lba(lba: u64) -> bool {
     if header.version != 2 {
         return false;
     }
-    let payload_size = match neur_payload_size(&header) {
-        Ok(size) => size,
-        Err(_) => return false,
-    };
-    let payload_end = NEUR_HEADER_SIZE + payload_size;
+    if header.model_type != NEUR_MODEL_SOLO
+        || header.input_dim != 64
+        || header.output_dim != NEUR_SOLO_OUTPUT_DIM
+        || header.quant_type != 0
+    {
+        return false;
+    }
+    let payload_end = NEUR_HEADER_SIZE + NEUR_SOLO_PAYLOAD_BYTES;
     if payload_end > nvme::DMA_PAGE_SIZE {
         return false;
     }
@@ -631,12 +551,11 @@ fn run_host_ipc_loop(
         if let Some((sequence, input_slot, t0_ready)) = mailbox.peek_input() {
             let t1_ingest = unsafe { read_tsc() };
             let published = mailbox.compute_and_publish_output(
-                1,
                 t0_ready,
                 t1_ingest,
-                |output_values| {
+                |output_value| {
                     let inputs = unsafe { input_slot.payload() };
-                    infer_values(inputs, model, avx2_enabled, output_values);
+                    *output_value = infer_one(inputs, model, avx2_enabled);
                     unsafe { read_tsc() }
                 },
             );
@@ -690,7 +609,6 @@ fn run_mmio_loop(
     let mut drops = 0u64;
     let mut samples = [LatencySample::default(); MAX_LATENCY_SAMPLES];
     let mut cursor = 0usize;
-    let output_dim = 1;
 
     serial_println!(
         "[MMIO]: IVSHMEM ring active; capacity={}, frame_limit={}, timeout={} s.",
@@ -706,12 +624,11 @@ fn run_mmio_loop(
         if let Some((sequence, input_slot, t0_ready)) = mailbox.peek_input() {
             let t1_ingest = unsafe { read_tsc() };
             let published = mailbox.compute_and_publish_output(
-                output_dim,
                 t0_ready,
                 t1_ingest,
-                |output_values| {
+                |output_value| {
                     let inputs = unsafe { input_slot.payload() };
-                    infer_values(inputs, model, avx2_enabled, output_values);
+                    *output_value = infer_one(inputs, model, avx2_enabled);
                     unsafe { read_tsc() }
                 },
             );
@@ -1147,7 +1064,7 @@ fn main(
                 serial_println!("[LOADER]: Using model shard from UEFI FAT filesystem.");
             }
             serial_println!(
-                "[SOLO MODEL]: authenticated shard retained; projection=row 0, output_dim=1, recurrent_state=disabled"
+                "[SOLO MODEL]: authenticated native Solo payload ingested directly; output_dim=1, recurrent_state=disabled"
             );
             loaded_model
         }
@@ -1293,7 +1210,9 @@ fn main(
         calibrated_timeout_cycles
     };
     serial_println!(
-        "[UART]: COM2 RX=NB+64 or NS+stream_id+64; stream tags ignored by stateless Solo; NR+stream_id is a no-op, standalone NR exits; frame_limit={}, timeout={} s ({} cycles)",
+        "[UART]: COM2 SO ingress={} bytes (64 signed values), SR egress={} bytes (one i32 LE scalar), NU+u64 hot-swap control; frame_limit={}, timeout={} s ({} cycles)",
+        serial::INPUT_FRAME_SIZE,
+        serial::OUTPUT_FRAME_SIZE,
         STREAM_FRAME_LIMIT,
         STREAM_TIMEOUT_SECONDS,
         stream_timeout_cycles
@@ -1311,12 +1230,9 @@ fn main(
 
     let mut frame_reader = serial::FrameReader::new();
     let stream_start = unsafe { read_tsc() };
-    let mut stream_events = 0u64;
-    let mut reset_commands = 0u64;
     let mut update_commands = 0u64;
     let mut update_successes = 0u64;
     let mut update_failures = 0u64;
-    let mut reset_seen = false;
     let mut frames_ingress = 0u64;
     let mut frames_transmitted = 0u64;
     let mut ring_full_drops = 0u64;
@@ -1326,10 +1242,9 @@ fn main(
     let mut latency_samples_total = 0u64;
     let mut telemetry_ring = telemetry::TelemetryRing::new();
 
-    while !reset_seen
-        && (STREAM_FRAME_LIMIT == 0
-            || stream_events < STREAM_FRAME_LIMIT
-            || smp::shard_update_in_progress())
+    while (STREAM_FRAME_LIMIT == 0
+        || frames_ingress < STREAM_FRAME_LIMIT
+        || smp::shard_update_in_progress())
         && unsafe { read_tsc() }.saturating_sub(stream_start) < stream_timeout_cycles
     {
         hardware_watchdog.kick_watchdog();
@@ -1358,35 +1273,12 @@ fn main(
                         payload: received.payload,
                         t0_preamble: received.preamble_tsc,
                         t1_ingress: received.ingress_tsc,
-                        stream_id: received.stream_id,
                     };
                     if input_producer.push(frame).is_ok() {
                         frames_ingress += 1;
-                        stream_events += 1;
                     } else {
                         ring_full_drops += 1;
                     }
-                }
-                serial::FrameEvent::Reset { stream_id, .. } => {
-                    let target_stream = stream_id.unwrap_or(0);
-                    reset_commands += 1;
-                    stream_events += 1;
-                    if stream_id.is_none() {
-                        reset_seen = true;
-                    }
-                    serial_println!(
-                        "[SOLO CONTROL]: command=NR reset_count={} stream={} stateless=true",
-                        reset_commands,
-                        target_stream
-                    );
-                }
-                serial::FrameEvent::InvalidStreamSelector(stream_id) => {
-                    stream_events += 1;
-                    serial_println!(
-                        "[UART CONTROL ERROR]: stream selector={} is outside 0..{}",
-                        stream_id,
-                        serial::ATTENTION_STREAM_COUNT
-                    );
                 }
                 serial::FrameEvent::Update { lba } => {
                     update_commands += 1;
@@ -1459,11 +1351,10 @@ fn main(
             .min(u64::MAX as u128) as u64
     };
     serial_println!(
-        "[UART]: RX frames={}, TX frames={}, reset_commands={}, stream_events={}, ring_full_drops={}, elapsed_cycles={}, throughput={}.{:03} frames/s",
+        "[UART]: RX frames={}, TX frames={}, update_commands={}, ring_full_drops={}, elapsed_cycles={}, throughput={}.{:03} frames/s",
         frames_ingress,
         frames_transmitted,
-        reset_commands,
-        stream_events,
+        update_commands,
         ring_full_drops,
         elapsed_cycles,
         throughput_milli_fps / 1000,
@@ -1521,36 +1412,80 @@ mod solo_runtime_tests {
     use super::*;
 
     #[test]
-    fn frame_dispatch_writes_exactly_one_solo_value() {
+    fn frame_dispatch_returns_one_solo_scalar() {
         let weights = TernaryWeights64::from_masks(1, 0).unwrap();
         let model = LoadedModel {
             solo_weights: weights,
         };
         let mut inputs = [0i8; 64];
         inputs[0] = -9;
-        let mut outputs = [77i32; 64];
-
-        assert_eq!(infer_values(&inputs, &model, false, &mut outputs), 1);
-        assert_eq!(outputs[0], -1);
-        assert!(outputs[1..].iter().all(|&value| value == 77));
+        assert_eq!(infer_one(&inputs, &model, false), -1);
 
         if std::is_x86_feature_detected!("avx2") {
-            outputs.fill(77);
-            assert_eq!(infer_values(&inputs, &model, true, &mut outputs), 1);
-            assert_eq!(outputs[0], -1);
-            assert!(outputs[1..].iter().all(|&value| value == 77));
+            assert_eq!(infer_one(&inputs, &model, true), -1);
         }
     }
 
     #[test]
-    fn pot_query_projection_reduces_coefficients_to_ternary_signs() {
-        let mut row = [0u8; 32];
-        row[0] = 0x29; // low nibble -1, high nibble +1
-        row[1] = 0x08; // reserved nibble and zero both map to zero
-        let weights = pot_query_row_to_solo(&row);
-        assert_eq!(&weights.lanes[..4], &[-1, 1, 0, 0]);
-        assert_eq!(weights.pos_mask & 0b1111, 0b0010);
-        assert_eq!(weights.neg_mask & 0b1111, 0b0001);
+    fn native_solo_shard_serializes_verifies_and_ingests_directly() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        const TEST_SIGNING_SEED: [u8; 32] = [
+            0x9D, 0x61, 0xB1, 0x9D, 0xEF, 0xFD, 0x5A, 0x60, 0xBA, 0x84, 0x4A, 0xF4, 0x92, 0xEC,
+            0x2C, 0xC4, 0x44, 0x49, 0xC5, 0x69, 0x7B, 0x32, 0x69, 0x19, 0x70, 0x3B, 0xAC, 0x03,
+            0x1C, 0xAE, 0x7F, 0x60,
+        ];
+        let signing_key = SigningKey::from_bytes(&TEST_SIGNING_SEED);
+        assert_eq!(
+            signing_key.verifying_key().to_bytes(),
+            crypto::NEUR_SIGNING_PUBLIC_KEY
+        );
+
+        let mut packed = [0u8; NEUR_SOLO_PAYLOAD_BYTES];
+        for index in 0..64 {
+            let code = match (index * 7 + 2) % 3 {
+                0 => 0b00,
+                1 => 0b01,
+                _ => 0b11,
+            };
+            packed[index >> 2] |= code << ((index & 3) * 2);
+        }
+
+        let mut record = [0u8; 512];
+        record[0..4].copy_from_slice(b"NEUR");
+        record[4..8].copy_from_slice(&2u32.to_le_bytes());
+        record[8..12].copy_from_slice(&64u32.to_le_bytes());
+        record[12] = NEUR_MODEL_SOLO;
+        record[13..15].copy_from_slice(&NEUR_SOLO_OUTPUT_DIM.to_le_bytes());
+        record[15] = 0;
+        let payload_start = NEUR_HEADER_SIZE;
+        let payload_end = payload_start + NEUR_SOLO_PAYLOAD_BYTES;
+        record[payload_start..payload_end].copy_from_slice(&packed);
+
+        let mut message = [0u8; NEUR_BASE_HEADER_SIZE + NEUR_SOLO_PAYLOAD_BYTES];
+        message[..NEUR_BASE_HEADER_SIZE].copy_from_slice(&record[..NEUR_BASE_HEADER_SIZE]);
+        message[NEUR_BASE_HEADER_SIZE..].copy_from_slice(&packed);
+        let signature = signing_key.sign(&message).to_bytes();
+        record[NEUR_BASE_HEADER_SIZE..NEUR_HEADER_SIZE].copy_from_slice(&signature);
+
+        assert_eq!(payload_end, 96);
+        assert!(crypto::verify_solo_neur_signature(
+            &record[..NEUR_BASE_HEADER_SIZE],
+            &record[NEUR_BASE_HEADER_SIZE..NEUR_HEADER_SIZE],
+            &record[payload_start..payload_end],
+        ));
+        assert!(record[payload_end..].iter().all(|&byte| byte == 0));
+
+        let (model, header) = parse_neur_shard(&record).expect("native Solo shard should load");
+        assert_eq!(header.version, 2);
+        assert_eq!(header.input_dim, 64);
+        assert_eq!(header.model_type, NEUR_MODEL_SOLO);
+        assert_eq!(header.output_dim, NEUR_SOLO_OUTPUT_DIM);
+        assert_eq!(
+            model.solo_weights,
+            TernaryWeights64::from_packed(&packed),
+            "the 16-byte Solo payload must be decoded without projecting another model"
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ $client = $null
 try {
     cargo +nightly build --target x86_64-unknown-uefi --release
     if ($LASTEXITCODE -ne 0) { throw "UEFI release build failed: $LASTEXITCODE" }
-    python tools/payload_builder/build_payload.py $UpdateShardPath --model mlp --variant zero
+    python tools/payload_builder/build_payload.py $UpdateShardPath --model solo --variant zero
     if ($LASTEXITCODE -ne 0) { throw "Signed zero-model shard generation failed: $LASTEXITCODE" }
     python tools/package_image.py --hot-swap-shard $UpdateShardPath --output $ImagePath
     if ($LASTEXITCODE -ne 0) { throw "Hot-swap image packaging failed: $LASTEXITCODE" }
@@ -73,35 +73,30 @@ try {
 
     function Send-InferenceFrame([int]$frameNumber, [bool]$expectZero) {
         $request = New-Object byte[] 66
-        $request[0] = 0x4E
-        $request[1] = 0x42
+        $request[0] = 0x53
+        $request[1] = 0x4F
         for ($index = 2; $index -lt $request.Length; $index++) { $request[$index] = 1 }
         $stream.Write($request, 0, $request.Length)
         $stream.Flush()
 
-        $response = New-Object byte[] 7
+        $response = New-Object byte[] 6
         $offset = 0
         while ($offset -lt $response.Length) {
             $count = $stream.Read($response, $offset, $response.Length - $offset)
             if ($count -le 0) { throw "COM2 disconnected before response frame $frameNumber" }
             $offset += $count
         }
-        if ($response[0] -ne 0x4E -or $response[1] -ne 0x52 -or $response[2] -ne 1) {
-            throw "Response frame $frameNumber had an invalid NR header"
+        if ($response[0] -ne 0x53 -or $response[1] -ne 0x52) {
+            throw "Response frame $frameNumber had an invalid SR header"
         }
-        $values = New-Object int[] 1
-        $nonzero = 0
-        for ($index = 0; $index -lt 1; $index++) {
-            $values[$index] = [BitConverter]::ToInt32($response, 3 + ($index * 4))
-            if ($values[$index] -lt -1 -or $values[$index] -gt 1) {
-                throw "Frame $frameNumber returned a value outside the Solo action range: $($values[$index])"
-            }
-            if ($values[$index] -ne 0) { $nonzero++ }
+        $value = [BitConverter]::ToInt32($response, 2)
+        if ($value -lt -1 -or $value -gt 1) {
+            throw "Frame $frameNumber returned a value outside the Solo action range: $value"
         }
-        if ($expectZero -and $nonzero -ne 0) {
-            throw "Frame $frameNumber used old model output after swap; nonzero lanes=$nonzero"
+        if ($expectZero -and $value -ne 0) {
+            throw "Frame $frameNumber used old model output after swap; value=$value"
         }
-        Write-Host "[HOTSWAP TEST]: frame=$frameNumber model=$(if ($expectZero) { 'shadow-zero' } else { 'initial-solo' }) output=$($values[0])"
+        Write-Host "[HOTSWAP TEST]: frame=$frameNumber model=$(if ($expectZero) { 'shadow-zero' } else { 'initial-solo' }) scalar=$value"
     }
 
     Send-InferenceFrame 1 $false
@@ -128,7 +123,7 @@ try {
         "\[HOTSWAP SUMMARY\]: commands=1, successful=1, rejected=0",
         "\[SMP\]: $($CpuCount - 1)/$($CpuCount - 1) Application Processors awakened and parked",
         "\[TOPOLOGY AUX VERIFY\]: APIC ID=[0-9]+, ring_samples=[1-9][0-9]*, queue_depth=0",
-        "\[UART\]: RX frames=8, TX frames=8, reset_commands=0, stream_events=8, ring_full_drops=0"
+        "\[UART\]: RX frames=8, TX frames=8, update_commands=1, ring_full_drops=0"
     )
     foreach ($pattern in $required) {
         if (-not (Select-String -Path $serialLog -Pattern $pattern -Quiet)) {

@@ -23,7 +23,7 @@ mod windows_host {
     const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
 
     const MAGIC: u32 = 0x5348_4D42;
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
     const CAPACITY: u64 = 16;
     const INPUT_READY: u32 = 1;
     const INPUT_EMPTY: u32 = 0;
@@ -32,9 +32,12 @@ mod windows_host {
     const INPUT_BASE: usize = 64;
     const INPUT_SLOT_SIZE: usize = 128;
     const OUTPUT_BASE: usize = 64 + 16 * INPUT_SLOT_SIZE;
-    const OUTPUT_SLOT_SIZE: usize = 384;
-    const OUTPUT_VALUES_OFFSET: usize = 64;
-    const OUTPUT_METADATA_OFFSET: usize = 320;
+    const OUTPUT_SLOT_SIZE: usize = 128;
+    const OUTPUT_VALUE_OFFSET: usize = 64;
+    const SO_PREAMBLE: [u8; 2] = *b"SO";
+    const SO_FRAME_SIZE: usize = 66;
+    const SR_PREAMBLE: [u8; 2] = *b"SR";
+    const SR_FRAME_SIZE: usize = 6;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -240,10 +243,19 @@ mod windows_host {
                 return Err("input slot is not empty".to_string());
             }
 
+            let mut so_frame = [0u8; SO_FRAME_SIZE];
+            so_frame[..SO_PREAMBLE.len()].copy_from_slice(&SO_PREAMBLE);
+            for (index, value) in input.iter().enumerate() {
+                so_frame[index + SO_PREAMBLE.len()] = *value as i8 as u8;
+            }
             let frame_start = Instant::now();
             unsafe {
-                for (index, value) in input.iter().enumerate() {
-                    ptr::write_volatile(mapping.view.add(input_slot_offset + 64 + index), *value as i8 as u8);
+                for index in 0..64 {
+                    // The mailbox carries SO's 64-byte payload; its wire preamble is transport-only.
+                    ptr::write_volatile(
+                        mapping.view.add(input_slot_offset + 64 + index),
+                        so_frame[index + SO_PREAMBLE.len()],
+                    );
                 }
             }
             // Guest T0 is measured at READY observation; the host timestamp is wall-clock only.
@@ -263,30 +275,36 @@ mod windows_host {
                     .then_some((output_tail, offset))
             })?;
 
-            let output_dim = unsafe { ptr::read_volatile(mapping.view.add(output_slot_offset + OUTPUT_METADATA_OFFSET).cast::<u32>()) };
-            if output_dim != 1 {
-                return Err(format!("guest output_dim={output_dim}, expected 1"));
-            }
-            let mut actual_bytes = [0u8; 4];
-            let mut expected_bytes = [0u8; 4];
-            for index in 0..1 {
-                let actual = unsafe {
-                    ptr::read_unaligned(mapping.view.add(output_slot_offset + OUTPUT_VALUES_OFFSET + index * 4).cast::<i32>())
-                };
-                if actual != expected[index] {
-                    return Err(format!("frame {frame_index} output {index}: guest={actual}, expected={}", expected[index]));
+            let mut sr_frame = [0u8; SR_FRAME_SIZE];
+            sr_frame[..SR_PREAMBLE.len()].copy_from_slice(&SR_PREAMBLE);
+            unsafe {
+                for index in 0..4 {
+                    sr_frame[SR_PREAMBLE.len() + index] = ptr::read_volatile(
+                        mapping
+                            .view
+                            .add(output_slot_offset + OUTPUT_VALUE_OFFSET + index),
+                    );
                 }
-                actual_bytes[index * 4..index * 4 + 4].copy_from_slice(&actual.to_le_bytes());
-                expected_bytes[index * 4..index * 4 + 4].copy_from_slice(&expected[index].to_le_bytes());
             }
-            if actual_bytes != expected_bytes {
-                return Err(format!("frame {frame_index} output bytes differ from expected bytes"));
+            if sr_frame.len() != SR_FRAME_SIZE || sr_frame[..2] != SR_PREAMBLE {
+                return Err("guest scalar did not form the six-byte SR response".to_string());
+            }
+            let actual = i32::from_le_bytes(
+                sr_frame[SR_PREAMBLE.len()..]
+                    .try_into()
+                    .expect("four-byte SR scalar"),
+            );
+            if !(-1..=1).contains(&actual) {
+                return Err(format!("frame {frame_index} returned invalid Solo scalar {actual}"));
+            }
+            if actual != expected[0] {
+                return Err(format!("frame {frame_index} scalar: guest={actual}, expected={}", expected[0]));
             }
 
             mapping.atomic_u32(output_slot_offset).store(OUTPUT_EMPTY, Ordering::Release);
             mapping.atomic_u64(32).store(output_sequence.wrapping_add(1), Ordering::Release);
             latencies.push(frame_start.elapsed());
-            println!("[HOST IPC]: frame={frame_index} parity=match round_trip_us={:.3}", latencies.last().unwrap().as_secs_f64() * 1_000_000.0);
+            println!("[HOST IPC]: frame={frame_index} SO_payload=64 bytes scalar={actual} parity=match round_trip_us={:.3}", latencies.last().unwrap().as_secs_f64() * 1_000_000.0);
         }
 
         latencies.sort_unstable();

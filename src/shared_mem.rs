@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const MAILBOX_MAGIC: u32 = 0x5348_4D42;
-pub const MAILBOX_VERSION: u32 = 1;
+pub const MAILBOX_VERSION: u32 = 2;
 pub const MAILBOX_CAPACITY: usize = 16;
 pub const HOST_MAILBOX_PHYSICAL_BASE: u64 = 0x1_0000_0000;
 pub const HOST_MAILBOX_WINDOW_SIZE: usize = 64 * 1024;
@@ -46,7 +46,8 @@ unsafe impl Sync for InputSlot {}
 pub struct OutputSlot {
     pub state: AtomicU32,
     pub _state_padding: [u8; 60],
-    pub values: UnsafeCell<[i32; 64]>,
+    pub value: UnsafeCell<i32>,
+    pub _value_padding: [u8; 4],
     pub metadata: UnsafeCell<OutputMetadata>,
     pub t3_commit: AtomicU64,
     pub _tail_padding: [u8; 24],
@@ -55,7 +56,6 @@ pub struct OutputSlot {
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct OutputMetadata {
-    pub output_dim: u32,
     pub t0_ready: u64,
     pub t1_ingest: u64,
     pub t2_compute: u64,
@@ -66,9 +66,9 @@ impl OutputSlot {
         Self {
             state: AtomicU32::new(OUTPUT_EMPTY),
             _state_padding: [0; 60],
-            values: UnsafeCell::new([0; 64]),
+            value: UnsafeCell::new(0),
+            _value_padding: [0; 4],
             metadata: UnsafeCell::new(OutputMetadata {
-                output_dim: 0,
                 t0_ready: 0,
                 t1_ingest: 0,
                 t2_compute: 0,
@@ -177,8 +177,7 @@ impl SharedMailbox {
     /// Publishes a result directly to its output slot, then advances output_head.
     pub fn publish_output(
         &self,
-        output_dim: usize,
-        values: &[i32; 64],
+        value: i32,
         t0_ready: u64,
         t1_ingest: u64,
         t2_compute: u64,
@@ -186,7 +185,7 @@ impl SharedMailbox {
     ) -> Result<u64, ()> {
         let head = self.output_head.load(Ordering::Relaxed);
         let tail = self.output_tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= MAILBOX_CAPACITY as u64 || output_dim > 64 {
+        if head.wrapping_sub(tail) >= MAILBOX_CAPACITY as u64 {
             return Err(());
         }
 
@@ -194,12 +193,9 @@ impl SharedMailbox {
         if slot.state.load(Ordering::Acquire) != OUTPUT_EMPTY {
             return Err(());
         }
-        unsafe {
-            core::ptr::copy_nonoverlapping(values.as_ptr(), (*slot.values.get()).as_mut_ptr(), 64);
-        }
+        unsafe { *slot.value.get() = value };
         unsafe {
             *slot.metadata.get() = OutputMetadata {
-                output_dim: output_dim as u32,
                 t0_ready,
                 t1_ingest,
                 t2_compute,
@@ -213,20 +209,19 @@ impl SharedMailbox {
     }
 
     /// Computes directly into the next shared output slot and publishes it.
-    /// The callback writes the final output array in-place and returns T2.
+    /// The callback writes the scalar decision in-place and returns T2.
     pub fn compute_and_publish_output<F>(
         &self,
-        output_dim: usize,
         t0_ready: u64,
         t1_ingest: u64,
         compute: F,
     ) -> Result<(u64, u64, u64), ()>
     where
-        F: FnOnce(&mut [i32; 64]) -> u64,
+        F: FnOnce(&mut i32) -> u64,
     {
         let head = self.output_head.load(Ordering::Relaxed);
         let tail = self.output_tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= MAILBOX_CAPACITY as u64 || output_dim > 64 {
+        if head.wrapping_sub(tail) >= MAILBOX_CAPACITY as u64 {
             return Err(());
         }
 
@@ -234,10 +229,9 @@ impl SharedMailbox {
         if slot.state.load(Ordering::Acquire) != OUTPUT_EMPTY {
             return Err(());
         }
-        let t2_compute = unsafe { compute(&mut *slot.values.get()) };
+        let t2_compute = unsafe { compute(&mut *slot.value.get()) };
         unsafe {
             *slot.metadata.get() = OutputMetadata {
-                output_dim: output_dim as u32,
                 t0_ready,
                 t1_ingest,
                 t2_compute,
@@ -252,7 +246,7 @@ impl SharedMailbox {
     }
 
     /// Test/consumer operation: copy a committed output then release its slot.
-    pub fn consume_output(&self) -> Option<(u64, [i32; 64], u32)> {
+    pub fn consume_output(&self) -> Option<(u64, i32)> {
         let tail = self.output_tail.load(Ordering::Relaxed);
         let head = self.output_head.load(Ordering::Acquire);
         if tail == head {
@@ -262,15 +256,11 @@ impl SharedMailbox {
         if slot.state.load(Ordering::Acquire) != OUTPUT_READY {
             return None;
         }
-        let mut values = [0i32; 64];
-        unsafe {
-            core::ptr::copy_nonoverlapping((*slot.values.get()).as_ptr(), values.as_mut_ptr(), 64);
-        }
-        let output_dim = unsafe { (*slot.metadata.get()).output_dim };
+        let value = unsafe { *slot.value.get() };
         slot.state.store(OUTPUT_EMPTY, Ordering::Release);
         self.output_tail
             .store(tail.wrapping_add(1), Ordering::Release);
-        Some((tail, values, output_dim))
+        Some((tail, value))
     }
 }
 
@@ -278,6 +268,30 @@ const _: () = assert!(core::mem::align_of::<SharedMailbox>() == 64);
 const _: () = assert!(core::mem::size_of::<InputSlot>() % 64 == 0);
 const _: () = assert!(core::mem::size_of::<OutputSlot>() % 64 == 0);
 const _: () = assert!(core::mem::offset_of!(InputSlot, payload) % 64 == 0);
-const _: () = assert!(core::mem::offset_of!(OutputSlot, values) % 64 == 0);
+const _: () = assert!(core::mem::offset_of!(OutputSlot, value) == 64);
+const _: () = assert!(core::mem::offset_of!(OutputSlot, metadata) == 72);
+const _: () = assert!(core::mem::size_of::<OutputSlot>() == 128);
 const _: () = assert!(core::mem::offset_of!(SharedMailbox, input_slots) % 64 == 0);
 const _: () = assert!(core::mem::offset_of!(SharedMailbox, output_slots) % 64 == 0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mailbox_v2_round_trips_64_inputs_and_one_scalar() {
+        let mailbox = SharedMailbox::new();
+        let input = core::array::from_fn(|index| (index as i8).wrapping_mul(7));
+        assert_eq!(mailbox.try_publish_input(&input, 11), Ok(0));
+        let (sequence, slot, _) = mailbox.peek_input().expect("input slot should be ready");
+        assert_eq!(sequence, 0);
+        assert_eq!(unsafe { *slot.payload() }, input);
+        mailbox.consume_input(sequence);
+
+        assert_eq!(mailbox.publish_output(-1, 11, 12, 13, 14), Ok(0));
+        assert_eq!(mailbox.consume_output(), Some((0, -1)));
+        assert_eq!(MAILBOX_VERSION, 2);
+        assert_eq!(core::mem::offset_of!(OutputSlot, value), 64);
+        assert_eq!(core::mem::size_of::<OutputSlot>(), 128);
+    }
+}

@@ -1,7 +1,7 @@
 param(
     [string]$outPath = "dist/production_shard.bin",
     [ValidateRange(512, 4096)][int]$blockSize = 512,
-    [ValidateSet("mlp", "attention")][string]$model = "mlp",
+    [ValidateSet("solo", "mlp", "attention")][string]$model = "solo",
     [ValidateSet("pattern", "zero")][string]$variant = "pattern",
     [ValidateSet("ternary", "pot")][string]$quant = "ternary",
     [ValidateRange(0, 6)][int]$potScale = 0,

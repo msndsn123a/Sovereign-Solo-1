@@ -28,7 +28,7 @@ def generate_signed_default_shard(shard_path):
     host = next(line.split(":", 1)[1].strip() for line in rustc.splitlines() if line.startswith("host:"))
     command = [
         "cargo", "run", "--manifest-path", "tools/payload_builder/Cargo.toml",
-        "--target", host, "--release", "--", "--model", "mlp", "--output", shard_path,
+        "--target", host, "--release", "--", "--model", "solo", "--output", shard_path,
     ]
     os.makedirs(os.path.dirname(shard_path) or ".", exist_ok=True)
     subprocess.run(command, check=True, cwd=repo_root)
@@ -254,15 +254,19 @@ def package_appliance_image(
         with open(shard_path, "rb") as file:
             shard_bytes = file.read()
     if (
-        len(shard_bytes) < 80
+        len(shard_bytes) < 96
         or shard_bytes[:4] != b"NEUR"
         or struct.unpack_from("<I", shard_bytes, 4)[0] != 2
+        or struct.unpack_from("<I", shard_bytes, 8)[0] != 64
+        or shard_bytes[12] != 2
+        or struct.unpack_from("<H", shard_bytes, 13)[0] != 1
+        or shard_bytes[15] != 0
     ):
         if os.path.normcase(os.path.normpath(shard_path)) != os.path.normcase(
             os.path.normpath("dist/production_shard.bin")
         ):
             raise ValueError("custom shard is unsigned/legacy; provide a signed NEUR v2 shard")
-        print("[PACKAGE_IMAGE]: Legacy/unsigned default shard found; generating signed NEUR v2 default")
+        print("[PACKAGE_IMAGE]: Missing or incompatible default shard; generating signed native Solo NEUR v2 shard")
         generate_signed_default_shard(shard_path)
         with open(shard_path, "rb") as file:
             shard_bytes = file.read()

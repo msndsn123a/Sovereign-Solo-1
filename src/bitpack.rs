@@ -26,6 +26,9 @@ pub const NEUR_OUTPUT_DIM: u16 = 16;
 pub const NEUR_ATTN_DIM: u8 = 16;
 pub const NEUR_MODEL_MLP: u8 = 0;
 pub const NEUR_MODEL_CAUSAL_LINEAR_ATTENTION: u8 = 1;
+pub const NEUR_MODEL_SOLO: u8 = 2;
+pub const NEUR_SOLO_OUTPUT_DIM: u16 = 1;
+pub const NEUR_SOLO_PAYLOAD_BYTES: usize = 16;
 pub const NEUR_QUANT_POT: u8 = 1;
 pub const NEUR_FLAG_POT: u8 = 0x40;
 pub const NEUR_FLAG_BLOCK_SPARSE: u8 = 0x40;
@@ -98,6 +101,7 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
     let header_flags = data[15];
     let hidden_or_attn_dim = header_flags & 0x3F;
     let multi_stream = header_flags & NEUR_FLAG_MULTI_STREAM != 0;
+    let is_solo = model_type == NEUR_MODEL_SOLO;
     let is_attention = model_type == NEUR_MODEL_CAUSAL_LINEAR_ATTENTION;
     let is_mlp = model_type == NEUR_MODEL_MLP;
     let feature_flag = header_flags & NEUR_FLAG_POT != 0;
@@ -107,17 +111,25 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
     if input_dim != NEUR_INPUT_DIM {
         return Err(NeurHeaderError::UnsupportedInputDimension);
     }
-    if output_dim != NEUR_OUTPUT_DIM {
+    if (is_solo && output_dim != NEUR_SOLO_OUTPUT_DIM)
+        || (!is_solo && output_dim != NEUR_OUTPUT_DIM)
+    {
         return Err(NeurHeaderError::InvalidOutputDimension);
+    }
+    if is_solo && (output_meta != NEUR_SOLO_OUTPUT_DIM || header_flags != 0) {
+        return Err(NeurHeaderError::NonzeroReservedByte);
     }
     if pot_scale > 6 || (quant_type == NEUR_QUANT_TERNARY && pot_scale != 0) {
         return Err(NeurHeaderError::UnsupportedQuantization);
     }
 
-    if !(is_attention || is_mlp) {
+    if !(is_solo || is_attention || is_mlp) {
         return Err(NeurHeaderError::UnsupportedQuantization);
     }
     if quant_type == NEUR_QUANT_POT && !is_attention {
+        return Err(NeurHeaderError::UnsupportedQuantization);
+    }
+    if is_solo && quant_type != NEUR_QUANT_TERNARY {
         return Err(NeurHeaderError::UnsupportedQuantization);
     }
     if multi_stream && !is_attention {
@@ -127,7 +139,9 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
         return Err(NeurHeaderError::NonzeroReservedByte);
     }
 
-    let hidden_dim = if is_attention {
+    let hidden_dim = if is_solo {
+        0
+    } else if is_attention {
         if hidden_or_attn_dim != NEUR_ATTN_DIM {
             return Err(NeurHeaderError::InvalidHiddenDimension);
         }
@@ -146,7 +160,9 @@ pub fn parse_neur_header(data: &[u8]) -> Result<NeurHeader, NeurHeaderError> {
         output_dim,
         quant_type,
         model_type,
-        attn_dim: if is_attention {
+        attn_dim: if is_solo {
+            0
+        } else if is_attention {
             hidden_or_attn_dim as u16
         } else {
             NEUR_ATTN_DIM as u16

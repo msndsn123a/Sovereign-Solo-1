@@ -2,8 +2,8 @@ param(
     [int]$Port = 5556,
     [string]$QemuAccel = "",
     [string]$QemuCpu = "Skylake-Server,+avx512f,+avx512dq",
-    [string]$ShardPath = "dist/trained_pure_mlp_shard.bin",
-    [string]$ExpectedPath = "dist/trained_pure_mlp_expected.json",
+    [string]$ShardPath = "dist/trained_pure_solo_shard.bin",
+    [string]$ExpectedPath = "dist/trained_pure_solo_expected.json",
     [string]$EfiPath = "target/x86_64-unknown-uefi/release/neural_box_core.efi"
 )
 
@@ -25,19 +25,15 @@ try {
     }
 
     $shardBytes = [System.IO.File]::ReadAllBytes((Resolve-Path $ShardPath))
-    if ($shardBytes.Length -lt 720 -or [System.Text.Encoding]::ASCII.GetString($shardBytes, 0, 4) -ne "NEUR") {
-        throw "Shard does not contain a complete signed NEUR v2 header/payload"
+    if ($shardBytes.Length -lt 96 -or [System.Text.Encoding]::ASCII.GetString($shardBytes, 0, 4) -ne "NEUR") {
+        throw "Shard does not contain a complete signed native Solo record"
     }
     $version = [BitConverter]::ToUInt32($shardBytes, 4)
     $inputDim = [BitConverter]::ToUInt32($shardBytes, 8)
-    $quantType = $shardBytes[12]
+    $modelType = $shardBytes[12]
     $outputDim = [BitConverter]::ToUInt16($shardBytes, 13)
-    $hiddenDim = $shardBytes[15]
-    if ($version -ne 2 -or $inputDim -ne 64 -or $hiddenDim -ne 32 -or $outputDim -ne 16 -or $quantType -ne 0) {
-        throw "Shard header is not the supported signed v2 64->32->16 ternary MLP"
-    }
-    if ($shardBytes.Length -lt 720) {
-        throw "Signed dual-layer shard is truncated; expected at least 720 bytes"
+    if ($version -ne 2 -or $inputDim -ne 64 -or $modelType -ne 2 -or $outputDim -ne 1 -or $shardBytes[15] -ne 0) {
+        throw "Shard header is not the native signed v2 64->1 Solo format"
     }
     $expected = Get-Content -Raw -Path $ExpectedPath | ConvertFrom-Json
     $testInputs = @($expected.test_batch_i8)
@@ -129,12 +125,11 @@ try {
     }
     Write-Host "[ROUNDTRIP]: Received COM2 readiness handshake."
 
-    $wireOutputDim = 1
-    $expectedLength = 3 + (4 * $wireOutputDim)
+    $expectedLength = 6
     for ($frameIndex = 0; $frameIndex -lt $testInputs.Count; $frameIndex++) {
         $inputFrame = New-Object byte[] 66
-        $inputFrame[0] = 0x4E
-        $inputFrame[1] = 0x42
+        $inputFrame[0] = 0x53
+        $inputFrame[1] = 0x4F
         for ($index = 0; $index -lt 64; $index++) {
             $value = [int]$testInputs[$frameIndex][$index]
             if ($value -lt -128 -or $value -gt 127) { throw "Test input is outside int8 range" }
@@ -153,21 +148,18 @@ try {
             $offset += $received
         }
 
-        if ($response[0] -ne 0x4E -or $response[1] -ne 0x52 -or $response[2] -ne $wireOutputDim) {
-            throw "Output frame $frameIndex preamble or output_dim did not match"
+        if ($response[0] -ne 0x53 -or $response[1] -ne 0x52) {
+            throw "Output frame $frameIndex did not contain the SR preamble"
         }
-        $expectedBytes = New-Object byte[] (4 * $wireOutputDim)
-        for ($index = 0; $index -lt $wireOutputDim; $index++) {
-            $actual = [BitConverter]::ToInt32($response, 3 + ($index * 4))
-            $expectedValue = [int]$testOutputs[$frameIndex][$index]
-            if ($actual -ne $expectedValue) {
-                throw "Frame $frameIndex output $index mismatch: QEMU=$actual, PyTorch=$expectedValue"
-            }
-            [BitConverter]::GetBytes($expectedValue).CopyTo($expectedBytes, $index * 4)
+        $actual = [BitConverter]::ToInt32($response, 2)
+        $expectedValue = [int]$testOutputs[$frameIndex][0]
+        if ($actual -ne $expectedValue) {
+            throw "Frame $frameIndex scalar mismatch: QEMU=$actual, Solo reference=$expectedValue"
         }
-        for ($index = 0; $index -lt $expectedBytes.Length; $index++) {
-            if ($response[$index + 3] -ne $expectedBytes[$index]) {
-                throw "Frame $frameIndex output byte $index differs from PyTorch reference bytes"
+        $expectedBytes = [BitConverter]::GetBytes($expectedValue)
+        for ($index = 0; $index -lt 4; $index++) {
+            if ($response[$index + 2] -ne $expectedBytes[$index]) {
+                throw "Frame $frameIndex scalar byte $index differs from little-endian reference bytes"
             }
         }
     }
@@ -183,17 +175,17 @@ try {
         if (-not ($telemetry.Line -match "\[SHM\]: Initialized Mailbox at physical addr .*alignment=64")) {
             throw "COM1 log did not confirm an aligned shared mailbox allocation"
         }
-        if (-not ($telemetry.Line -match "\[SOLO VERIFY\]: output_dim=1; frames=16, drops=0, scalar_reference=match")) {
+        if (-not ($telemetry.Line -match "\[SOLO VERIFY\]: scalar mailbox parity=match; frames=16, drops=0")) {
             throw "COM1 log did not confirm Solo scalar parity and zero drops"
         }
-        if (-not ($telemetry.Line -match "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=0, HIDDEN_OR_ATTN_DIM=32, OUTPUT_DIM=16")) {
+        if (-not ($telemetry.Line -match "\[SHARD\]: MAGIC=0x4E455552, VERSION=2, INPUT_DIM=64, MODEL_TYPE=2, HIDDEN_OR_ATTN_DIM=0, OUTPUT_DIM=1")) {
             throw "COM1 log did not confirm the signed v2 NEUR header dimensions"
         }
         if (-not ($telemetry.Line -match "\[SECURITY\]: Shard signature valid \(Ed25519 verified\)")) {
             throw "COM1 log did not confirm Ed25519 shard authentication"
         }
-        if (-not ($telemetry.Line -match "\[SOLO MODEL\]: authenticated shard retained; projection=row 0, output_dim=1, recurrent_state=disabled")) {
-            throw "COM1 log did not confirm the authenticated shard's Solo projection"
+        if (-not ($telemetry.Line -match "\[SOLO MODEL\]: authenticated native Solo payload ingested directly; output_dim=1, recurrent_state=disabled")) {
+            throw "COM1 log did not confirm direct native Solo ingestion"
         }
         if (-not ($telemetry.Line -match "\[TIMER\]: Calibrated TSC frequency")) {
             throw "COM1 log did not contain the TSC calibration report"

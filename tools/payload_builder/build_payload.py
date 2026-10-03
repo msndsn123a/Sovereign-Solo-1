@@ -10,7 +10,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", nargs="?", default="dist/production_shard.bin")
     parser.add_argument("--block-size", type=int, default=512)
-    parser.add_argument("--model", choices=("mlp", "attention"), default="mlp")
+    parser.add_argument("--model", choices=("solo", "mlp", "attention"), default="solo")
     parser.add_argument("--variant", choices=("pattern", "zero"), default="pattern")
     parser.add_argument("--quant", choices=("ternary", "pot"), default="ternary")
     parser.add_argument("--multi-stream", action="store_true")

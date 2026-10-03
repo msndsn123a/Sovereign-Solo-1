@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export a trained QAT checkpoint into a validated NEUR 64->32->16 shard."""
+"""Export a trained QAT checkpoint's Solo row into a signed native NEUR shard."""
 
 from __future__ import annotations
 
@@ -25,9 +25,8 @@ UNSIGNED_INPUT_VERSION = 1
 VERSION = 2
 QUANT_TERNARY = 0
 HEADER_SIZE = 16
-LAYER1_BYTES = 32 * 16
-LAYER2_BYTES = 16 * 8
-PAYLOAD_SIZE = HEADER_SIZE + LAYER1_BYTES + LAYER2_BYTES
+SOLO_WEIGHT_BYTES = 16
+UNSIGNED_RECORD_SIZE = HEADER_SIZE + SOLO_WEIGHT_BYTES
 
 
 def quantized_int8(tensor: torch.Tensor) -> list[list[int]]:
@@ -51,20 +50,14 @@ def validate_packed(data: bytes) -> None:
         raise ValueError("packed weight payload uses invalid ternary code 10b")
 
 
-def encode_shard(layer1: list[list[int]], layer2: list[list[int]], block_size: int) -> bytes:
-    if len(layer1) != HIDDEN_DIM or any(len(row) != INPUT_DIM for row in layer1):
-        raise ValueError("layer1 dimensions must be exactly (32, 64)")
-    if len(layer2) != OUTPUT_DIM or any(len(row) != HIDDEN_DIM for row in layer2):
-        raise ValueError("layer2 dimensions must be exactly (16, 32)")
+def encode_shard(weights: list[int], block_size: int) -> bytes:
+    if len(weights) != INPUT_DIM:
+        raise ValueError("native Solo weights must contain exactly 64 ternary values")
     if block_size not in (512, 4096):
         raise ValueError("block_size must be either 512 or 4096")
 
-    payload = bytearray()
-    for row in layer1:
-        payload.extend(pack_row(row, INPUT_DIM))
-    for row in layer2:
-        payload.extend(pack_row(row, HIDDEN_DIM))
-    if len(payload) != LAYER1_BYTES + LAYER2_BYTES:
+    payload = pack_row(weights, INPUT_DIM)
+    if len(payload) != SOLO_WEIGHT_BYTES:
         raise ValueError("internal packed payload size mismatch")
     validate_packed(payload)
 
@@ -72,9 +65,9 @@ def encode_shard(layer1: list[list[int]], layer2: list[list[int]], block_size: i
     header[0:4] = MAGIC
     struct.pack_into("<I", header, 4, UNSIGNED_INPUT_VERSION)
     struct.pack_into("<I", header, 8, INPUT_DIM)
-    header[12] = QUANT_TERNARY
-    struct.pack_into("<H", header, 13, OUTPUT_DIM)
-    header[15] = HIDDEN_DIM
+    header[12] = 2  # Native Solo model type.
+    struct.pack_into("<H", header, 13, 1)
+    header[15] = 0
 
     shard = header + payload
     shard.extend(bytes((-len(shard)) % block_size))
@@ -83,19 +76,16 @@ def encode_shard(layer1: list[list[int]], layer2: list[list[int]], block_size: i
 
 
 def validate_header_and_size(shard: bytes, block_size: int) -> None:
-    if len(shard) % block_size != 0 or len(shard) < PAYLOAD_SIZE:
+    if len(shard) % block_size != 0 or len(shard) < UNSIGNED_RECORD_SIZE:
         raise ValueError("shard size is not LBA-padded or is truncated")
     if shard[0:4] != MAGIC:
         raise ValueError("bad NEUR magic")
     version, input_dim = struct.unpack_from("<II", shard, 4)
-    quant_type = shard[12]
+    model_type = shard[12]
     output_dim = struct.unpack_from("<H", shard, 13)[0]
-    hidden_dim = shard[15]
-    if (version, input_dim, hidden_dim, output_dim, quant_type) != (
-        UNSIGNED_INPUT_VERSION, INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM, QUANT_TERNARY
-    ):
-        raise ValueError("NEUR header fields do not match the 64->32->16 ternary format")
-    validate_packed(shard[HEADER_SIZE:PAYLOAD_SIZE])
+    if (version, input_dim, model_type, output_dim, shard[15]) != (UNSIGNED_INPUT_VERSION, INPUT_DIM, 2, 1, 0):
+        raise ValueError("NEUR header fields do not match the native 64->1 Solo format")
+    validate_packed(shard[HEADER_SIZE:UNSIGNED_RECORD_SIZE])
 
 
 def run_integer_reference(inputs: list[int], layer1: list[list[int]], layer2: list[list[int]]) -> list[int]:
@@ -120,8 +110,8 @@ def run_solo_reference(inputs: list[int], weights: list[int]) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", default="dist/pure_mlp_qat.pt")
-    parser.add_argument("--output", default="dist/trained_pure_mlp_shard.bin")
-    parser.add_argument("--expected", default="dist/trained_pure_mlp_expected.json")
+    parser.add_argument("--output", default="dist/trained_pure_solo_shard.bin")
+    parser.add_argument("--expected", default="dist/trained_pure_solo_expected.json")
     parser.add_argument("--block-size", type=int, default=512, choices=(512, 4096))
     parser.add_argument("--version", type=int, default=VERSION)
     parser.add_argument("--key-file", help="optional raw 32-byte Ed25519 seed file")
@@ -137,7 +127,7 @@ def main() -> None:
 
     layer1 = quantized_int8(model.layer1.weight)
     layer2 = quantized_int8(model.layer2.weight)
-    unsigned_shard = encode_shard(layer1, layer2, args.block_size)
+    unsigned_shard = encode_shard(layer1[0], args.block_size)
 
     # Deterministic signed-int8 batch, serialized for frame-by-frame QEMU comparison.
     test_batch = [
@@ -178,25 +168,31 @@ def main() -> None:
     finally:
         unsigned_path.unlink(missing_ok=True)
     shard = output_path.read_bytes()
-    if len(shard) % args.block_size or len(shard) < 80 + LAYER1_BYTES + LAYER2_BYTES:
+    if len(shard) % args.block_size or len(shard) < 80 + SOLO_WEIGHT_BYTES:
         raise ValueError("signed NEUR v2 shard has invalid size")
     signed_version = struct.unpack_from("<I", shard, 4)[0]
-    if shard[:4] != MAGIC or signed_version != 2:
-        raise ValueError("signer did not produce a NEUR v2 shard")
+    if (
+        shard[:4] != MAGIC
+        or signed_version != 2
+        or struct.unpack_from("<I", shard, 8)[0] != INPUT_DIM
+        or shard[12] != 2
+        or struct.unpack_from("<H", shard, 13)[0] != 1
+        or shard[15] != 0
+    ):
+        raise ValueError("signer did not produce a native NEUR v2 Solo shard")
     expected = {
         "test_batch_i8": test_batch,
         "test_batch_output_i32": expected_batch,
         "test_batch_solo_i32": solo_reference,
-        "dimensions": {"input": INPUT_DIM, "hidden": HIDDEN_DIM, "output": OUTPUT_DIM},
+        "dimensions": {"input": INPUT_DIM, "output": 1},
         "shard_sha256": hashlib.sha256(shard).hexdigest(),
     }
     expected_path.write_text(json.dumps(expected, indent=2) + "\n", encoding="utf-8")
 
     print(
-        "[SHARD EXPORT]: magic=NEUR version=2 input_dim=64 hidden_dim=32 output_dim=16 quant_type=0 signature=Ed25519"
+        "[SHARD EXPORT]: magic=NEUR version=2 model_type=2 input_dim=64 output_dim=1 payload=16 bytes signature=Ed25519"
     )
-    print(f"[SHARD EXPORT]: layer1={LAYER1_BYTES} bytes layer2={LAYER2_BYTES} bytes")
-    print(f"[SHARD EXPORT]: unsigned_payload={PAYLOAD_SIZE - HEADER_SIZE} bytes signed_header=80 bytes padded_size={len(shard)} block_size={args.block_size}")
+    print(f"[SHARD EXPORT]: signed_record={80 + SOLO_WEIGHT_BYTES} bytes padded_size={len(shard)} block_size={args.block_size}")
     print(f"[SHARD EXPORT]: sha256={expected['shard_sha256']}")
     print(f"[SHARD EXPORT]: shard={output_path} expected={expected_path}")
     print(

@@ -12,14 +12,12 @@ pub struct InputFrame {
     pub payload: [i8; 64],
     pub t0_preamble: u64,
     pub t1_ingress: u64,
-    pub stream_id: u8,
 }
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputFrame {
-    pub output_dim: u8,
-    pub values: [i32; 64],
+    pub value: i32,
     pub t0_preamble: u64,
     pub t1_ingress: u64,
     pub t2_compute: u64,
@@ -27,8 +25,7 @@ pub struct OutputFrame {
 
 impl OutputFrame {
     pub const ZERO: Self = Self {
-        output_dim: 0,
-        values: [0; 64],
+        value: 0,
         t0_preamble: 0,
         t1_ingress: 0,
         t2_compute: 0,
@@ -129,3 +126,8 @@ impl<T: Copy> Consumer<'_, T> {
 
 pub type InputRing = SpscRing<InputFrame>;
 pub type OutputRing = SpscRing<OutputFrame>;
+
+const _: () = assert!(core::mem::align_of::<InputFrame>() == 64);
+const _: () = assert!(core::mem::size_of::<InputFrame>() % 64 == 0);
+const _: () = assert!(core::mem::align_of::<OutputFrame>() == 64);
+const _: () = assert!(core::mem::size_of::<OutputFrame>() == 64);

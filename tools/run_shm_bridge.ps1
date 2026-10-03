@@ -1,7 +1,7 @@
 param(
     [int]$Port = 5568,
-    [string]$ShardPath = "dist/trained_pure_mlp_shard.bin",
-    [string]$ExpectedPath = "dist/trained_pure_mlp_expected.json",
+    [string]$ShardPath = "dist/trained_pure_solo_shard.bin",
+    [string]$ExpectedPath = "dist/trained_pure_solo_expected.json",
     [string]$MailboxPath = "dist/shm_mailbox.bin",
     [string]$QemuAccel = "whpx"
 )
@@ -58,7 +58,7 @@ try {
         throw "QEMU guest did not exit after the configured host IPC frame count"
     }
     if (Test-Path $serialLog) {
-        $patterns = @("\[SHM\]: Initialized Mailbox", "\[SHM HOST IPC\]", "\[LATENCY\]: host_ipc_", "\[SHARD\]: MAGIC", "\[SHARD\]: Layer [12]", "\[SIMD\]:")
+        $patterns = @("\[SHM\]: Initialized Mailbox", "\[SHM HOST IPC\]", "\[LATENCY\]: host_ipc_", "\[SHARD\]: MAGIC", "\[SOLO MODEL\]", "\[SIMD\]:")
         $telemetry = Select-String -Path $serialLog -Pattern $patterns
         $telemetry | ForEach-Object { Write-Host $_.Line }
         if (-not ($telemetry.Line -match "\[SHM HOST IPC\]: guest_processed=8, drops=0")) {

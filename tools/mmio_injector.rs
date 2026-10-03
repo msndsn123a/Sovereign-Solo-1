@@ -19,16 +19,15 @@ mod windows_host {
     const PAGE_READWRITE: u32 = 0x04;
     const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
     const MAILBOX_MAGIC: u32 = 0x5348_4D42;
-    const MAILBOX_VERSION: u32 = 1;
+    const MAILBOX_VERSION: u32 = 2;
     const CAPACITY: u64 = 16;
     const INPUT_READY: u32 = 1;
     const OUTPUT_READY: u32 = 1;
     const INPUT_BASE: usize = 64;
     const INPUT_SLOT_SIZE: usize = 128;
     const OUTPUT_BASE: usize = INPUT_BASE + 16 * INPUT_SLOT_SIZE;
-    const OUTPUT_SLOT_SIZE: usize = 384;
-    const OUTPUT_VALUES_OFFSET: usize = 64;
-    const OUTPUT_METADATA_OFFSET: usize = 320;
+    const OUTPUT_SLOT_SIZE: usize = 128;
+    const OUTPUT_VALUE_OFFSET: usize = 64;
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -198,29 +197,21 @@ mod windows_host {
                     .then_some((tail, offset))
             })?;
 
-            let output_dim = unsafe {
-                ptr::read_volatile(
-                    mapping
-                        .view
-                        .add(output_offset + OUTPUT_METADATA_OFFSET)
-                        .cast::<u32>(),
-                )
-            };
-            if output_dim != 1 {
-                return Err(format!("frame {frame}: output_dim={output_dim}, expected 1"));
-            }
-            for index in 0..1 {
-                let value = unsafe {
-                    ptr::read_unaligned(
+            let bytes = unsafe {
+                core::array::from_fn(|index| {
+                    ptr::read_volatile(
                         mapping
                             .view
-                            .add(output_offset + OUTPUT_VALUES_OFFSET + index * 4)
-                            .cast::<i32>(),
+                            .add(output_offset + OUTPUT_VALUE_OFFSET + index),
                     )
-                };
-                if value != 0 {
-                    return Err(format!("frame {frame}, output {index}: got {value}, expected 0"));
-                }
+                })
+            };
+            let value = i32::from_le_bytes(bytes);
+            if !(-1..=1).contains(&value) {
+                return Err(format!("frame {frame}: invalid Solo scalar {value}"));
+            }
+            if value != 0 {
+                return Err(format!("frame {frame}: got scalar {value}, expected 0"));
             }
 
             mapping.atomic_u32(output_offset).store(0, Ordering::Release);
@@ -229,7 +220,7 @@ mod windows_host {
                 .store(output_sequence.wrapping_add(1), Ordering::Release);
             host_latencies[frame] = started.elapsed();
             println!(
-                "[MMIO HOST]: frame={frame} output=match round_trip_us={:.3}",
+                "[MMIO HOST]: frame={frame} scalar={value} output=match round_trip_us={:.3}",
                 host_latencies[frame].as_secs_f64() * 1_000_000.0
             );
         }
