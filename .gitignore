@@ -1,6 +1,8 @@
 **/target/
 /target/
 /dist/
+/tmp/
+**/.tmp/
 /dist/*.log
 /dist/*.img
 /dist/*.tmp
@@ -9,6 +11,7 @@ node_modules/
 *.log
 *.tmp
 *.temp
+*.unsigned
 *.img
 *.qcow2
 *.vdi
@@ -30,6 +33,7 @@ venv/
 build/
 **/build/
 *.exe
+*.rmeta
 *.pdb
 *.dll
 __pycache__/

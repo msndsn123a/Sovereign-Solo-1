@@ -1,183 +1,142 @@
-[![Live Wasm Proof](https://img.shields.io/badge/Live-Wasm%20Proof-1fb8a5?logo=webassembly&logoColor=white)](https://msndsn123a.github.io/Sovereign-Solo-1/)
+# Sovereign-Solo: Sub-5ns Deterministic Bare-Metal Scalar Inference Appliance
 
-# Sovereign-Solo: Sub-5ns Deterministic Bare-Metal Neural Inference Appliance
+> **[Open the Live Wasm Proof and Interactive Playground](https://msndsn123a.github.io/Sovereign-Solo-1/)** — 64 signed input lanes, one deterministic scalar decision, and an independent integer-parity check.
 
-**Compute contract:** stateless scalar evaluation, `64 × i8 → {-1, 0, +1}`; the AVX2 path has measured 13–14 TSC cycles (about 4.3–4.7 ns when interpreted at a 3.0 GHz TSC) in the repository's RDTSC microbenchmark under x86-64.
+Sovereign-Solo evaluates a pure feed-forward function, $x\in i8^{64}\rightarrow y\in\{-1,0,+1\}$, without recurrent state, a model server, a network connection, or a runtime heap allocator. The AVX2 compute kernel has reported a 13–14 TSC-tick minimum in host microbenchmarks (about 4.3–4.7 ns if interpreted at a nominal 3.0 GHz TSC). This is an observed compute-only result, not a physical-device guarantee or an end-to-end UART latency promise. The firmware is `no_std`; it still links its UEFI and Ed25519 Rust crates and is not literally free of code dependencies.
 
-The live WebAssembly lab runs client-side scalar parity checks: 64 signed inputs produce one scalar decision and the tested delta must be zero. It uses browser-native WebAssembly and JavaScript, with no CDN, installed package, external service, or server-side inference dependency. The lab verifies deterministic output; its browser timer does not measure bare-metal AVX2 latency.
+## 1. Microarchitecture & Compute Engine (`src/kernel.rs`)
 
-## 1. System Overview
+### Function evaluated
 
-Sovereign-Solo is a standalone x86-64 UEFI appliance. Firmware is Rust `#![no_std]`, has no Rust heap allocator, and evaluates each input frame independently. The active runtime result is one branchless scalar decision. Fixed buffers, the NVMe loader, shard verifier, shared mailbox, UART framing, and hot-swap machinery provide the appliance environment.
-
-### Inference data path
-
-1. Read a native Solo shard from UEFI `SimpleFileSystem`, or probe the supported raw-NVMe fallback locations if no file is found.
-2. Validate the v2 Solo metadata and 16-byte payload, verify the Ed25519 signature, and reject invalid ternary codes.
-3. Pass the payload's 16 packed bytes directly to `TernaryWeights64::from_packed`; no MLP/attention row projection or multi-layer runtime buffer is involved.
-4. For each frame, calculate the dot product of the 64 signed-byte inputs and the predecoded ternary weights.
-5. Convert the accumulator to `-1`, `0`, or `+1` without retaining state between frames; publish exactly one `i32` result.
-
-The AVX2 implementation uses inline assembly (`vpabsb`, `vpsignb`, multiply-add and horizontal-add instructions) over two YMM vectors. CPU and enabled-vector-state checks gate that path; `infer_scalar` is the fallback. The measured host RDTSC baseline has been 13–14 cycles (~4.3 ns at the low end, or about 4.3–4.7 ns across that range at a nominal 3.0 GHz TSC). This is a measurement of a particular host/test setup—not a guaranteed physical-device latency. See [Host unit tests and RDTSC benchmark](#host-unit-tests-and-rdtsc-benchmark).
-
-### Native Solo shard contract
-
-The firmware accepts the dedicated **NEUR v2 Solo** record. Its 16-byte metadata prefix contains ASCII magic `NEUR`, version `2`, input dimension `64`, model type `MODEL_TYPE_SOLO = 2`, output dimension `1`, and zero reserved/feature flags. The signed message is the metadata prefix concatenated with exactly 16 packed ternary bytes (64 weights, four 2-bit weights per byte). A signed record is therefore **96 bytes** before zero-padding to a 512- or 4096-byte logical block size:
-
-| Offset | Size | Field |
-|---:|---:|---|
-| 0 | 16 | Authenticated NEUR v2 Solo metadata |
-| 16 | 64 | Ed25519 signature over metadata plus payload |
-| 80 | 16 | Packed ternary Solo weights |
-| 96+ | variable | Zero padding to the target block boundary; not signed |
-
-The runtime rejects legacy MLP and attention shard types. The Rust payload builder and Python exporter emit native Solo records; the trained-checkpoint exporter deliberately selects a 64-weight row for its Solo artifact. Once signed, the firmware ingests that row directly rather than projecting it at runtime. A full-network training score does not by itself establish accuracy of the exported Solo row.
-
-## 2. Model Training and Quantization (`ml/`)
-
-### Current trainer and objective
-
-`ml/train_pure_mlp.py` is a deterministic, CPU-only PyTorch QAT trainer for a **64→32→16** ternary MLP. With no external dataset argument, it creates seeded synthetic training data: a seeded random ternary teacher creates labels, and the trainable model learns those labels. It is not an ONNX ingestion tool. The appliance format is Solo; the exporter emits the checkpoint's selected 64-weight row as a standalone one-output shard, not the full two-layer MLP.
-
-The model has two bias-free linear layers. Weights pass through a ternary straight-through estimator (STE): values above `+0.5` map to `+1`, values below `-0.5` map to `-1`, and the interval between maps to zero. The hidden activation is integer-style hard sign: positive to `+1`, negative to `-1`, and zero to `0`. Gradients use an STE mask; training itself uses floating-point PyTorch arithmetic and is an offline operation.
-
-The objective is cross-entropy plus a teacher-weight anchor:
+The shard contains 64 ternary coefficients $w_i\in\{-1,0,+1\}$. For signed-byte inputs $x_i\in[-128,127]$, the engine computes
 
 $$
-L = L_{CE} + \lambda\left(\|W_1-W_{teacher,1}\|_2^2 + \|W_2-W_{teacher,2}\|_2^2\right)
+s=\sum_{i=0}^{63}x_iw_i,\qquad y=\mathbf{1}_{s>0}-\mathbf{1}_{s<0}.
 $$
 
-This implementation does not apply a separate clipping pass. The forward quantizer and anchor term are the constraints used by this trainer. The appliance inference path is integer-only and stateless.
+The result is exactly `+1`, `0`, or `-1`; an accumulator tie produces zero. Since $|s|\le 64\cdot128=8192$, an `i32` accumulator is sufficient. There is no bias, activation stack, recurrent state, or second projection in the Solo inference path.
 
-Defaults: seed `2026`, 12 epochs, 2,048 generated training samples, 512 test samples, batch size 128, learning rate `0.001`, and anchor weight `10.0`. It writes a checkpoint and JSON metrics.
+`TernaryWeights64` is declared `#[repr(C, align(64))]`. It holds 64 decoded `i8` lanes, a positive-weight mask, and a negative-weight mask. The signed shard payload itself is only 16 packed bytes; loading expands it once before inference. Inputs and lanes are evaluated as two 32-byte halves.
 
-```powershell
-python ml/train_pure_mlp.py --checkpoint dist/pure_mlp_qat.pt --metrics dist/pure_mlp_qat_metrics.json
-```
+### AVX2 path and scalar fallback
 
-The trainer also accepts `--seed`, `--epochs`, `--train-samples`, `--test-samples`, `--batch-size`, `--learning-rate`, and `--anchor-weight`. PyTorch must be installed in the selected Python environment.
+`infer_avx2` is handwritten `core::arch::asm!` using fixed YMM/XMM registers and explicit clobbers. The sequence loads two input and two weight chunks (`ymm0`–`ymm3`), takes input magnitudes with `vpabsb`, applies input signs to ternary weights with `vpsignb`, forms pair products with `vpmaddubsw`, widens/combines with `vpmaddwd`, then accumulates and horizontally reduces to an `i32`. `vmovd` returns the accumulator and `vzeroupper` clears upper-vector state. The `-128` input bit pattern is handled by the unsigned/signed multiply-add sequence without saturating its pair sums.
 
-### Quantization and storage encoding
+The returned scalar uses the source-level branchless expression `(value > 0) as i32 - (value < 0) as i32`. This describes the Rust expression, not a guarantee about every compiler's emitted threshold instructions; no disassembly-level branchlessness claim is made. `infer_scalar` is the fallback.
 
-- Runtime inputs are signed bytes in the full `i8` range `[-128, 127]`. The synthetic trainer currently trains with values in `[-4, 4]`; that is a training-data choice, not a runtime input restriction.
-- Each ternary coefficient is encoded in two bits, four coefficients per byte, low index first: `00` = 0, `01` = +1, `11` = −1. `10` is invalid and rejected by payload validation.
-- A 64-element row occupies 16 packed bytes on disk. `TernaryWeights64::from_packed` decodes it once during shard loading/hot-swap into a 64-byte-aligned runtime representation. The complete in-memory struct also stores positive/negative masks; it is not merely a 64-byte file record.
-- `ml/export_pure_shard.py` quantizes and packs the selected 64-weight Solo row, invokes the Rust signer for a native Solo shard, and writes deterministic input/scalar-reference sidecars. The sidecar's `test_batch_solo_i32` values are the appliance reference; any full-network reference is for offline training comparison only.
+**Dispatch detail:** firmware enables the vector state through its AVX-512 OS-state path, then selects AVX2 only when AVX2 CPUID is also present. That state path requires AVX512F/XSAVE support. Consequently, a CPU with AVX2 but without the firmware's required AVX-512-state prerequisites can use scalar inference. The host parity test separately detects AVX2 for its own test.
 
-Exporter command and defaults:
+### Measured baseline and timer limits
 
-```powershell
-python ml/export_pure_shard.py --checkpoint dist/pure_mlp_qat.pt --output dist/trained_pure_solo_shard.bin --expected dist/trained_pure_solo_expected.json --block-size 512
-```
+The test `solo_kernel_rdtsc_cycle_benchmark` runs 1,024 calls per sample for seven samples and reports the minimum elapsed TSC ticks per call. The test currently enforces an AVX2 ceiling of 50 ticks; **13–14 ticks is a previously observed baseline, not a constant or asserted test result**. At 3.0 GHz, 13 ticks is about 4.33 ns and 14 is about 4.67 ns. TSC ticks need not equal current core-clock cycles; frequency and platform behavior vary. The microbenchmark uses fixed/hot input and weights, includes loop/checksum/measurement overhead, and does not represent cache misses, interrupts, UART time, or worst-case latency.
 
-Options are `--checkpoint`, `--output`, `--expected`, `--block-size` (`512` or `4096`), `--version` (must be `2`), and optional `--key-file` (raw 32-byte Ed25519 seed). Export requires a compatible `PureTernaryMLP` PyTorch state dict. It checks offline quantized outputs against an integer reference, then invokes the Rust payload signer for the native Solo row. The appliance evaluates the signed 16-byte row directly.
+The browser proof is a separate scalar WebAssembly parity check. Modern browsers commonly quantize `performance.now()` to roughly 0.781 µs steps; one call can therefore display `0.00 µs` or otherwise be below timer resolution. The playground averages a 10,000-pass batch to show a per-call nanosecond profile. That interval includes browser scheduling and the JavaScript/Wasm boundary; it is not a bare-metal RDTSC measurement.
 
-### ONNX conversion
+## 2. Dedicated Shard Architecture: Native `NEUR` v2 Solo
 
-`tools/onnx2neur/` is a separate native Rust converter. It accepts only Gemm/MatMul linear graphs meeting strict shape/dtype/bias constraints; it does not accept arbitrary ONNX operators. Its legacy MLP/attention outputs are not accepted by the Solo-only appliance loader. Use the Solo payload builder or trained-checkpoint exporter for a runtime-compatible shard.
+The appliance accepts the native Solo model type `MODEL_TYPE_SOLO = 2`, with input dimension 64 and output dimension 1. Legacy MLP/attention records may still be produced by separate conversion tooling, but the firmware shard loader rejects those model types.
 
-```powershell
-cargo +nightly build --manifest-path tools/onnx2neur/Cargo.toml --target x86_64-pc-windows-msvc --release
-cargo +nightly run --manifest-path tools/onnx2neur/Cargo.toml --target x86_64-pc-windows-msvc --release -- --input model.onnx --output dist/model.neur --key-file signing.seed --quant ternary --threshold 0.25 --block-size 512
-```
+### Signed envelope
 
-`--key-file` is required by this converter. `--threshold` defaults to `0.25`; `--pot-scale` accepts `0..6`; `--block-size` accepts powers of two from 512 through 4096. Its own README documents accepted graph shapes and restrictions.
-
-## 3. Cryptographic Packaging and Shard Ingestion (`tools/`)
-
-### Native signed shard layout
-
-The loader recognizes the **NEUR version 2 Solo** metadata prefix followed by a 64-byte Ed25519 signature and exactly 16 payload bytes. Sector/block padding follows the signed record and is not part of the signature.
+The metadata prefix is exactly 16 bytes. Ed25519 signs that prefix concatenated with the 16-byte payload; the signature field and sector padding are excluded.
 
 | Offset | Size | Field |
 |---:|---:|---|
 | 0 | 4 | ASCII magic `NEUR` |
-| 4 | 4 | Version, little-endian (`2` accepted by firmware) |
-| 8 | 4 | Input dimension, little-endian (`64`) |
-| 12 | 1 | Model type (`2`, native Solo) |
-| 13 | 2 | Output dimension `1`, little-endian |
-| 15 | 1 | Reserved flags, must be zero |
+| 4 | 4 | Version `2`, little-endian `u32` |
+| 8 | 4 | Input dimension `64`, little-endian `u32` |
+| 12 | 1 | Model type `2` (`MODEL_TYPE_SOLO`) |
+| 13 | 2 | Output dimension `1`, little-endian `u16` |
+| 15 | 1 | Solo flags/reserved byte; must be zero |
 | 16 | 64 | Ed25519 signature |
-| 80 | 16 | 64 packed ternary weights (`00` zero, `01` +1, `11` −1) |
+| 80 | 16 | 64 packed ternary weights |
+| 96+ | variable | Builder's zero padding to a target block boundary; unsigned |
 
-The signature message is `metadata_prefix[0..16] || payload`; the signature field and block padding are excluded. The signed record is exactly **96 bytes**. The builder pads it with zeros to 512 or 4096 bytes.
+Thus the **signed record is exactly 96 bytes**: 16 metadata + 64 signature + 16 payload. The payload encodes four weights per byte, low index first: `00` = zero, `01` = +1, `11` = −1; `10` is invalid. The builder supports power-of-two block sizes from 512 through 4096 (512, 1024, 2048, or 4096). The Python exporter intentionally offers 512 or 4096. Padding does not change the signed payload, and the firmware does not require padding bytes to be zero.
 
-The DMA destination is a 4 KiB-aligned buffer. Padding does not alter the 16-byte logical payload; the loader verifies only the authenticated metadata and payload before decoding it directly into Solo weights. Non-Solo model types, invalid ternary codes, altered metadata, and bad signatures are rejected.
+After validating the header, signature, and ternary encoding, `src/main.rs` converts the exact 16-byte slice to `[u8; 16]` and calls `TernaryWeights64::from_packed` directly. It does not parse a larger MLP/attention buffer or project row zero at runtime. The production trust key in `src/crypto.rs` is the RFC 8032 test-vector public key; the default signing seed is public test material and is not a production secret. A custom seed requires installing its matching public key in firmware and rebuilding the EFI image.
 
-### Ed25519 signing and key handling
+## 3. Wire & Transport Protocol: `SO` / `SR`
 
-`src/crypto.rs` verifies Ed25519 over metadata plus payload before a candidate model is promoted. It embeds the RFC 8032 test-vector public key. The Rust payload builder defaults to the matching deterministic test seed, which is public and **must not be treated as a production secret**. Use it only for tests. A custom `--key-file` seed is 32 raw bytes, but firmware will reject its shard until the corresponding public key is installed in source and the EFI image is rebuilt. Protect signing seeds outside the repository; `.gitignore` excludes common key formats.
+### UART frames
 
-Build a signed native Solo development shard with the wrapper (Solo is also the default model):
+`src/serial.rs` uses fixed-length, unescaped binary frames on COM2:
+
+| Direction | Exact layout | Total |
+|---|---|---:|
+| Ingress (`SO`) | `[0x53, 0x4F]` (`'S','O'`) followed by exactly 64 raw signed `i8` bytes | **66 bytes** |
+| Egress (`SR`) | `[0x53, 0x52]` (`'S','R'`) followed by one little-endian `i32` scalar | **6 bytes** |
+| Hot-swap (`NU`) | `[0x4E,0x55]` followed by a little-endian `u64` NVMe LBA | **10 bytes** |
+
+The parser has no checksum, escaping, or sequence number. It recognizes `SO` inference ingress and `NU` update requests; old `NB`, `NS`, and `NR` frame/control handling is not supported. COM2 sends the text readiness token `UART_READY\n` before binary streaming. `NU` is a separate control frame, not an SR response.
+
+### Internal SPSC rings
+
+`src/io_ring.rs` defines separate input and output SPSC rings with capacity 128. Each slot type is 64-byte aligned. `InputFrame` contains the 64-byte vector and two timestamps and is 128 bytes after alignment; `OutputFrame` contains one `i32` plus three timestamps and occupies one 64-byte cache line. Ring publication uses Release/Acquire atomics. These are internal records, not UART wire frames.
+
+### PCIe MMIO and Shared Mailbox ABI V2
+
+MMIO and host-backed shared memory use the same logical 64-byte input / one-scalar output contract, but carry only those values—not the literal UART SO/SR preamble bytes. `SharedMailbox` has magic `SHMB` (`0x53484D42`), version 2, capacity 16, and 64-byte alignment. The header is 64 bytes; input slots start at offset 64 and output slots at offset 2112. Every slot is 128 bytes:
+
+| Slot | Offset within slot | Contents |
+|---|---:|---|
+| Input | +0 | Atomic state |
+| Input | +8 | `t0_ready` (`u64`) |
+| Input | +64 | `[i8; 64]` payload |
+| Output | +0 | Atomic state |
+| Output | +64 | One `i32` scalar |
+| Output | +72, +80, +88 | `t0_ready`, `t1_ingest`, `t2_compute` timestamps |
+| Output | +96 | `t3_commit` timestamp |
+
+Total mailbox size is 4,160 bytes. Producers write a slot, publish `READY` with Release ordering, and advance the head; consumers observe state/head with Acquire ordering, compute or read the result in place, then release the slot and advance the tail. The host IPC bridge maps a 64 KiB host-backed window at guest physical address `0x1_0000_0000`. MMIO uses the IVSHMEM BAR as the shared backing region. The inbox payload is read directly by the guest compute callback; the scalar is written into the output slot rather than a 64-value array.
+
+## 4. Complete Tooling & Script Catalog
+
+Commands below are PowerShell commands run from the repository root unless noted. Windows-only host injectors require the Windows MSVC Rust toolchain. QEMU integration scripts also need the EFI image, OVMF, and their input artifacts.
+
+### Training and native Solo export
+
+`ml/train_pure_mlp.py` trains a deterministic offline 64→32→16 ternary model on seeded synthetic data; PyTorch is required. Weight quantization maps values above `+0.5` to +1, below `−0.5` to −1, and the interval between to zero. Export selects the first 64-weight row for the native Solo appliance artifact; full-network metrics are not the appliance scalar metric.
 
 ```powershell
+python ml/train_pure_mlp.py --checkpoint dist/pure_mlp_qat.pt --metrics dist/pure_mlp_qat_metrics.json
+python ml/export_pure_shard.py --checkpoint dist/pure_mlp_qat.pt --output dist/trained_pure_solo_shard.bin --expected dist/trained_pure_solo_expected.json --block-size 512
+```
+
+Exporter options: `--checkpoint`, `--output`, `--expected`, `--block-size {512,4096}`, `--version 2`, and optional `--key-file` (exactly 32 raw seed bytes). It writes the signed native Solo shard and an expected JSON sidecar containing test vectors and `test_batch_solo_i32`. The exporter uses a temporary unsigned shard when calling the Rust signer and removes it afterwards.
+
+Trainer options are `--checkpoint`, `--metrics`, `--seed` (2026), `--epochs` (12), `--train-samples` (2048), `--test-samples` (512), `--batch-size` (128), `--learning-rate` (0.001), and `--anchor-weight` (10.0). The exporter sidecar includes both `test_batch_output_i32` (offline MLP parity) and `test_batch_solo_i32` (the runtime's one-scalar reference); only the latter is compared as appliance output.
+
+### Payload builder and signer
+
+The native Solo defaults and recommended commands are:
+
+```powershell
+python tools/payload_builder/build_payload.py dist/production_shard.bin --model solo --block-size 512 --variant pattern
+python tools/payload_builder/build_payload.py dist/production_shard_4kn.bin --model solo --block-size 4096 --variant pattern
 & (Join-Path $PWD 'tools/payload_builder/build_payload.ps1') -outPath dist/production_shard.bin -blockSize 512 -model solo -variant pattern
-```
-
-The wrapper accepts `-outPath`, `-blockSize`, `-model solo|mlp|attention`, `-variant pattern|zero`, `-quant ternary|pot`, `-potScale 0..6`, `-multiStream`, `-pruneBlocks`, `-activationLut`, and `-keyFile`. Only `solo` produces a shard accepted by the current appliance runtime. Invoke its Python frontend directly with:
-
-```powershell
-python tools/payload_builder/build_payload.py dist/production_shard.bin --model solo --variant pattern --block-size 512
-```
-
-The Rust CLI can also be invoked directly:
-
-```powershell
 cargo +nightly run --manifest-path tools/payload_builder/Cargo.toml --target x86_64-pc-windows-msvc --release -- --model solo --output dist/production_shard.bin --block-size 512 --variant pattern
 ```
 
-It also accepts `--unsigned-input` to sign a native Solo metadata prefix plus its 16-byte payload. Firmware remains the authoritative dimension, payload, encoding, and signature validator; the signer does not replace those checks.
+Python CLI: optional positional output; `--model {solo,mlp,attention}` (default solo), `--block-size` (default 512), `--variant {pattern,zero}`, `--quant {ternary,pot}`, `--multi-stream`, `--pot-scale 0..6`, `--prune-blocks`, `--activation-lut`, and `--key-file`. The PowerShell wrapper exposes corresponding `-outPath`, `-blockSize`, `-model`, `-variant`, `-quant`, `-potScale`, switches `-multiStream`, `-pruneBlocks`, `-activationLut`, and `-keyFile`. Native Solo permits ternary weights only and rejects optional model flags. For Solo, choose 512 or 4096 bytes. The builder accepts powers of two between 512 and 4096; the exporter limits itself to 512/4096. Legacy builder modes do not make those formats loadable by this Solo-only firmware. The default deterministic signing seed is for development/tests only.
 
-### GPT image provisioning and storage
+### GPT/FAT32 appliance image
 
-`tools/package_image.py` creates a 512-byte-sector GPT image with two FAT32 partitions and an optional raw update region:
-
-| Region | LBA range (512-byte sectors) | Purpose |
-|---|---:|---|
-| ESP | 2048–133119 | UEFI application and startup script |
-| `NEURAL_DATA` | 133120–264191 | `weights.bin` file read by UEFI |
-| Reserved raw update area | begins at 264192 | Optional pre-staged signed hot-swap shard |
-
-Each FAT32 partition is 64 MiB; the image is 130 MiB. The raw update area is not a second model partition or A/B filesystem slot. Hot-swap uses two in-RAM model buffers/slots and an NVMe LBA update request. The packager writes an optional update shard at LBA 264192 in 512-byte units; firmware interprets the request in device logical-block units. QEMU tests use 512-byte logical blocks. For 4 KiB logical-block NVMe, convert the byte offset to device block units rather than reusing the 512-byte sector number.
-
-Package an image after building the EFI binary and a valid signed shard:
+`tools/package_image.py` creates a 512-byte-sector GPT image containing an ESP FAT32 partition (LBA 2048–133119), a `NEURAL_DATA` FAT32 partition (LBA 133120–264191) with `weights.bin`, and an optional raw update region beginning at LBA 264192. Each FAT32 partition is 64 MiB. It embeds the EFI file and signed shard; it checks Solo header fields but firmware remains authoritative for signature and payload validation. If the default production shard is absent or incompatible, the packager generates a native Solo default.
 
 ```powershell
 cargo +nightly build --target x86_64-unknown-uefi --release
 python tools/package_image.py --efi-path target/x86_64-unknown-uefi/release/neural_box_core.efi --shard-path dist/production_shard.bin --output dist/neural_box_appliance.img
+python tools/payload_builder/build_payload.py dist/hot_swap_zero_shard.bin --model solo --block-size 512 --variant zero
+python tools/package_image.py --efi-path target/x86_64-unknown-uefi/release/neural_box_core.efi --shard-path dist/production_shard.bin --output dist/neural_box_hot_swap.img --hot-swap-shard dist/hot_swap_zero_shard.bin
+& (Join-Path $PWD 'tools/package_image.ps1') -efiPath target/x86_64-unknown-uefi/release/neural_box_core.efi -shardPath dist/production_shard.bin -outPath dist/neural_box_appliance.img
 ```
 
-`tools/package_image.ps1` exposes `-efiPath`, `-shardPath`, and `-outPath`. `tools/package_image.py` also accepts `--hot-swap-shard <signed-file>` to write an update record into the reserved raw-LBA region. The packager checks NEUR v2 magic, dimensions, Solo model type, and reserved flags; firmware signature and ternary-payload validation remain authoritative.
+Python options are `--efi-path`, `--shard-path`, `--output`, and optional `--hot-swap-shard`. The PowerShell wrapper accepts `-efiPath`, `-shardPath`, `-outPath`. Image partition geometry is in 512-byte sectors; an NVMe `NU` request is in the device's logical block units. Convert the byte offset when using 4 KiB logical blocks.
 
-### Loader behavior and runtime verification
+### Host IPC and MMIO injectors
 
-Before `ExitBootServices`, the loader searches UEFI `SimpleFileSystem` handles for `\weights.bin` and `\NEURAL_WEIGHTS\weights.bin` using fixed buffers, then validates a found shard. A present but invalid file is rejected to the safe identity Solo model; it does not then try raw-NVMe fallback. Only if no file is found does fallback probe fixed byte offsets (133120, 34816, 67584, and 0) multiplied by 512; it is not a general GPT/partition scanner.
-
-For hot-swap, UART `NU` supplies an 8-byte little-endian raw NVMe LBA. An auxiliary AP reads and validates the candidate in the inactive DMA/model buffer. The active slot changes only after signature/payload verification and reader coordination; failure preserves the active model. This is an in-memory shadow swap, not disk Slot A/Slot B selection, and it requires a suitable secondary AP.
-
-## 4. Hardware Injection and Test Harnesses (`tools/`)
-
-### UART protocol
-
-The UART protocol in `src/serial.rs` uses fixed-size native Solo frames:
-
-| Direction | Bytes |
-|---|---|
-| Ingress | `SO` (`0x53 0x4F`) + exactly 64 signed `i8` bytes = **66 bytes** |
-| Egress | `SR` (`0x53 0x52`) + one little-endian `i32` decision = **6 bytes** |
-| Hot-swap request | `NU` + 8-byte little-endian raw NVMe LBA = 10 bytes |
-
-The fixed-length UART parser implements no checksum, escaping, or per-frame sequence number. COM2's startup handshake is `UART_READY\n`. Legacy `NB`, `NS`, and `NR` control framing is not supported. `tools/test_uart_roundtrip.ps1` validates the native Solo shard and compares six-byte SR responses against the scalar reference byte-for-byte.
-
-### Host IPC and MMIO mailbox transports
-
-UART, PCIe MMIO, and host-backed shared memory share the same logical Solo contract: 64 signed input bytes and one signed scalar decision. UART uses the literal SO/SR wire preambles. MMIO and the **Shared Mailbox V2** exchange the 64-byte vector and 4-byte scalar directly, without storing the UART preamble in a slot. The mailbox magic is `SHMB`, version `2`, capacity 16, with atomic head/tail counters and 128-byte cacheline-aligned input and output slots.
-
-- `tools/host_injector.rs` is Windows-only. It maps an existing 64 KiB backing file, reads `test_batch_i8` and `test_batch_solo_i32` from expected JSON, stages each input as a 66-byte SO frame, publishes its 64-byte body to the mailbox, and validates the corresponding six-byte SR scalar.
-- `tools/mmio_injector.rs` is Windows-only and maps a backing file. It publishes all-zero 64-byte vectors and validates one scalar `i32` in the output slot.
-- Neither injector creates the QEMU device. Use the matching bridge script. MMIO integration requires QEMU `memory-backend-file` and `ivshmem-plain` support.
-
-Build and invoke the Windows injectors directly (the backing files must already be mapped by the matching QEMU setup):
+Both injectors are Windows-only. Compile them with `rustc` from the repository root. They map an already-created backing file; QEMU must be started with the matching host memory or IVSHMEM device first.
 
 ```powershell
 rustc --edition=2021 -O tools/host_injector.rs -o dist/host_injector.exe
@@ -186,54 +145,60 @@ rustc --edition=2021 -O tools/mmio_injector.rs -o dist/mmio_injector.exe
 & (Join-Path $PWD 'dist/mmio_injector.exe') dist/ivshmem_mailbox.bin 8
 ```
 
-### PowerShell/QEMU script catalog
+`host_injector.exe <shm_mailbox.bin> <expected.json>` reads `test_batch_i8` and `test_batch_solo_i32`, requires 1–16 vectors of exactly 64 signed values and one expected scalar each, and reports wall-clock host round-trip time. It constructs an SO-shaped frame but only the 64-byte body occupies the shared mailbox slot; it validates the one-i32 output as the SR scalar. `mmio_injector.exe <backing-file> [frame-count]` defaults to 8 frames and accepts 1–16; it injects zero vectors and expects zero decisions. Neither tool constructs the QEMU device.
 
-Run examples from the repository root. QEMU harnesses require `assets/OVMF.fd`, the target EFI build, and their listed inputs.
+### QEMU / PowerShell test scripts
 
-| Script | Purpose and example |
+These end-to-end scripts require a working QEMU/OVMF setup. `-QemuCpu` defaults to `Skylake-Server,+avx512f,+avx512dq` where available; ports should be distinct for simultaneous guests.
+
+| Script | Command and behavior |
 |---|---|
-| `ml/run_pure_pipeline.ps1` | Train → export/sign → EFI build → UART roundtrip: `& (Join-Path $PWD 'ml/run_pure_pipeline.ps1') -Python C:/path/to/python.exe -Port 5558 -QemuAccel whpx -BlockSize 512`. The checked-in default Python path is machine-specific; pass Python with PyTorch installed. |
-| `tools/test_uart_roundtrip.ps1` | Send the exporter's eight signed-byte vectors as 66-byte SO frames and verify six-byte SR responses: `& (Join-Path $PWD 'tools/test_uart_roundtrip.ps1') -Port 5556 -QemuAccel whpx -ShardPath dist/trained_pure_solo_shard.bin -ExpectedPath dist/trained_pure_solo_expected.json`. Requires shard, sidecar JSON, and EFI file. |
-| `tools/test_dual_volume.ps1` | Boot GPT image, test native Solo FAT model load and eight zero-input SO/SR roundtrips: `& (Join-Path $PWD 'tools/test_dual_volume.ps1') -CpuCount 1 -ImagePath dist/neural_box_appliance.img`. `-TamperWeights` tests signature rejection. Requires a prebuilt image and EFI. |
-| `tools/test_hot_swap.ps1` | Build a signed zero-weight Solo update, package it at a raw LBA, stream SO/SR frames, and check post-swap zero decisions: `& (Join-Path $PWD 'tools/test_hot_swap.ps1') -CpuCount 2 -UpdateLba 264192`. Defaults are `dist/neural_box_hot_swap.img`, `dist/hot_swap_zero_shard.bin`, and LBA 264192; this script runs its own build/package steps. |
-| `tools/test_attention_sequence.ps1` | Legacy filename; now sends eight 66-byte SO requests and checks six-byte SR scalar responses: `& (Join-Path $PWD 'tools/test_attention_sequence.ps1') -CpuCount 2 -Port 5569`. Builds a native Solo test shard. |
-| `tools/test_mmio_pipeline.ps1` | Build/package, start IVSHMEM, run all-zero MMIO injection, and check zero-loss telemetry: `& (Join-Path $PWD 'tools/test_mmio_pipeline.ps1') -FrameCount 8 -MailboxPath dist/ivshmem_mailbox.bin`. Eight frames is coherent because the guest exits the MMIO loop at its fixed eight-frame limit. Requires QEMU file-backed memory and IVSHMEM support. |
-| `tools/run_shm_bridge.ps1` | Build with `host-ipc`, create a 64 KiB host-backed guest RAM window, start QEMU, launch host injector: `& (Join-Path $PWD 'tools/run_shm_bridge.ps1') -ShardPath dist/trained_pure_solo_shard.bin -ExpectedPath dist/trained_pure_solo_expected.json -MailboxPath dist/shm_mailbox.bin -QemuAccel whpx`. Its declared `-Port` parameter is currently unused. |
-| `tools/package_image.ps1` | Package GPT/FAT32 image: `& (Join-Path $PWD 'tools/package_image.ps1') -efiPath target/x86_64-unknown-uefi/release/neural_box_core.efi -shardPath dist/production_shard.bin -outPath dist/neural_box_appliance.img`. |
-| `tools/payload_builder/build_payload.ps1` | Build a signed native Solo shard: `& (Join-Path $PWD 'tools/payload_builder/build_payload.ps1') -outPath dist/production_shard.bin -blockSize 512 -model solo -variant pattern`. It accepts `-keyFile` for a raw 32-byte seed; firmware trust still depends on the embedded public key. |
+| `tools/test_uart_roundtrip.ps1` | `& .\tools\test_uart_roundtrip.ps1 -Port 5556 -QemuAccel whpx -ShardPath dist/trained_pure_solo_shard.bin -ExpectedPath dist/trained_pure_solo_expected.json` — validates the v2 Solo header/hash, sends the sidecar's vectors as 66-byte SO frames, and byte-compares each six-byte SR scalar. Params: `Port` 5556, `QemuAccel` empty, `QemuCpu` Skylake default, `ShardPath`, `ExpectedPath`, `EfiPath`. Requires exported shard/sidecar and EFI. |
+| `tools/test_hot_swap.ps1` | `& .\tools\test_hot_swap.ps1 -CpuCount 2 -UpdateLba 264192` — builds a zero-weight native Solo update, packages the image, sends SO/SR requests, issues NU, and verifies post-swap zero decisions. Params: `Port` 5571, `CpuCount` 2 (range 2–64), `ImagePath`, `UpdateShardPath`, `UpdateLba`. The packaged shard is written at the configured location; keep the request LBA aligned with that location (default 264192). |
+| `tools/test_dual_volume.ps1` | `& .\tools\test_dual_volume.ps1 -CpuCount 1 -ImagePath dist/neural_box_appliance.img` — boots GPT/FAT32, sends eight zero-input SO frames, validates SR scalars and loader telemetry. Params: `Port` 5570, `CpuCount` 1 (range 1–64), `-TamperWeights`, `QemuAccel`, `QemuCpu`, `ImagePath`. Tamper mode verifies signature rejection. Requires a prebuilt image and EFI. |
+| `tools/test_attention_sequence.ps1` | `& .\tools\test_attention_sequence.ps1 -CpuCount 2 -Port 5569` — legacy filename, now builds a native Solo shard and runs the eight-frame SO/SR protocol test. Params: `Port` 5569, `CpuCount` 2 (range 1–64), `QemuAccel`, `QemuCpu`, `ShardPath`, `EfiPath`. |
+| `tools/test_mmio_pipeline.ps1` | `& .\tools\test_mmio_pipeline.ps1 -FrameCount 8 -MailboxPath dist/ivshmem_mailbox.bin` — builds/packages, starts IVSHMEM, invokes the MMIO injector, and checks no-loss telemetry. Params: `QemuCpu`, `QemuAccel`, `FrameCount` (guest completion is fixed at eight), `ImagePath`, `MailboxPath`. QEMU must support `memory-backend-file` and `ivshmem-plain`; the script packages its default image path. |
+| `tools/run_shm_bridge.ps1` | `& .\tools\run_shm_bridge.ps1 -ShardPath dist/trained_pure_solo_shard.bin -ExpectedPath dist/trained_pure_solo_expected.json -MailboxPath dist/shm_mailbox.bin -QemuAccel whpx` — builds with `host-ipc`, starts QEMU with host-backed guest RAM, then runs the host injector. Params: `Port` (declared, currently unused), `ShardPath`, `ExpectedPath`, `MailboxPath`, `QemuAccel`. Requires the exported shard and sidecar. |
+| `ml/run_pure_pipeline.ps1` | `& .\ml\run_pure_pipeline.ps1 -Python C:/path/to/python.exe -Port 5558 -QemuAccel whpx -BlockSize 512` — runs training, export/sign, UEFI release build, and UART roundtrip. Params: `Python` (checked-in default is machine-specific), `Port`, `QemuAccel`, `BlockSize`. Python needs PyTorch. |
+| `tools/package_image.ps1` | `& .\tools\package_image.ps1 -efiPath target/x86_64-unknown-uefi/release/neural_box_core.efi -shardPath dist/production_shard.bin -outPath dist/neural_box_appliance.img` — wrapper around the image packager. |
+| `tools/payload_builder/build_payload.ps1` | `& .\tools\payload_builder\build_payload.ps1 -outPath dist/production_shard.bin -blockSize 512 -model solo -variant pattern` — wrapper around the native Rust signer; parameters described above. |
+| `tools/wasm_verifier/build.ps1` | `& .\tools\wasm_verifier\build.ps1` — no parameters; builds the locked release Wasm verifier and copies the `.wasm` artifact into its web directory. |
 
-Default QEMU CPU in several scripts is `Skylake-Server,+avx512f,+avx512dq`; individual scripts may override CPU/accelerator/port. `test_uart_roundtrip.ps1` defaults to port 5556, `test_dual_volume.ps1` to 5570, `test_hot_swap.ps1` to 5571, and `test_attention_sequence.ps1` to 5569. Use distinct ports for concurrent harnesses.
+### Archived scratch image diagnostics (`scratch/`)
 
-### Host IPC mailbox ABI details
+These scripts are not the production GPT/FAT32 workflow. Several hard-code the old machine-specific `C:\Users\IMOE001\9\...` workspace, construct legacy unsigned NEUR v1 records, or depend on an external `qemu-img.exe`; do not use them to create shards for this firmware. They are listed for source-tree completeness:
 
-The mailbox header occupies bytes `0..63`: magic/version at offsets 0/4 and four `u64` ring cursors at 8, 16, 24, and 32. Input slots start at byte 64; there are 16 × 128-byte slots. Each input slot has state at +0, T0 at +8, and its 64-byte payload at +64. Output slots start at byte 2112; there are 16 × 128-byte slots. Each output slot has state at +0, one `i32` scalar at +64, timestamp metadata at +72 (`t0_ready`, `t1_ingest`, `t2_compute`), and `t3_commit` at +96. Both slot types are 64-byte aligned; the total mailbox size is 4,160 bytes within the 64 KiB host-backed window. Host round-trip time is wall-clock timing; the guest records its own TSC stage values.
+| Script | Parameters and effect |
+|---|---|
+| `scratch/create_weights.ps1` | Empty file; no parameters or behavior. |
+| `scratch/test_64k.ps1` | Empty file; no parameters or behavior. |
+| `scratch/inspect_fat.ps1` | No parameters. Reads the hard-coded `C:\Users\IMOE001\9\scratch\qemu_fat16.img` and prints MBR/FAT geometry. |
+| `scratch/test_builder.ps1` | Optional `-outPath` (hard-coded workspace default). Uses hard-coded `qemu-img.exe`, builds an experimental image and writes a legacy unsigned version-1 shard; not runtime-compatible. |
+| `scratch/test_custom_fat16.ps1` | `-efiPath` and `-outPath`, both with hard-coded workspace defaults. Builds a test FAT16 image and embeds a legacy unsigned version-1 raw payload. |
+| `scratch/test_fat32.ps1` | `-efiPath` and `-outPath`, both with hard-coded workspace defaults. Builds an experimental MBR/FAT32 image and embeds a legacy unsigned version-1 raw payload. |
 
-## 5. Developer Operations and Build Recipes
+MMIO additionally requires a QEMU build with file-backed memory and IVSHMEM support. Host injector timing is `std::time::Instant`; firmware timing is TSC-based and represents different intervals.
 
-### Prerequisites
+## 5. Appliance Build & Operational Recipes
 
-- Rust Nightly and `x86_64-unknown-uefi` (`rustup +nightly target add x86_64-unknown-uefi`).
-- Windows MSVC host target/runner for the documented host test.
-- Python 3 and PyTorch for training under `ml/`; neither is required by firmware runtime.
-- `wasm32-unknown-unknown` for the browser lab (`rustup +nightly target add wasm32-unknown-unknown`).
-- QEMU and OVMF for QEMU harnesses. MMIO additionally needs QEMU `memory-backend-file` and `ivshmem-plain`.
-
-### Host unit tests and RDTSC benchmark
+### Host tests and microbenchmark
 
 ```powershell
 cargo +nightly test --bin neural_box_core --target x86_64-pc-windows-msvc -- --nocapture
 ```
 
-On a host advertising AVX2 and enabled YMM state, tests compare scalar/AVX2 decisions, check deterministic stateless calls and frame dispatch, and print a minimum cycles-per-call RDTSC result. This is host evidence, not a target-hardware worst-case guarantee.
+The suite covers Solo arithmetic/parity, SO/SR framing, v2 mailbox layout, signature/shard ingestion, and hardware-independent firmware helpers. The RDTSC test prints a host-specific minimum; it does not promise 13–14 ticks on another machine.
 
-### UEFI build
+### Bare-metal UEFI
 
 ```powershell
 cargo +nightly check --target x86_64-unknown-uefi
 cargo +nightly build --target x86_64-unknown-uefi --release
 ```
 
-### Wasm verifier build and browser check
+The release output is `target/x86_64-unknown-uefi/release/neural_box_core.efi`. Build the release before packaging or starting a QEMU appliance scenario.
+
+### Wasm verification engine and playground
 
 ```powershell
 cargo +nightly build --locked --manifest-path tools/wasm_verifier/Cargo.toml --no-default-features --target wasm32-unknown-unknown --release
@@ -241,29 +206,22 @@ Copy-Item tools/wasm_verifier/target/wasm32-unknown-unknown/release/wasm_verifie
 node tools/wasm_verifier/serve.js
 ```
 
-Visit `http://127.0.0.1:8000/`, run **Run scalar parity suite**, and confirm five vectors have delta zero. Browser timing averages 10,000 calls because `performance.now()` may be coarsened; it includes browser/runtime overhead and is not the bare-metal RDTSC result.
+Open `http://127.0.0.1:8000/`, load the standalone Wasm kernel, run **Run scalar parity suite**, and verify all five test cases have delta zero. The live GitHub Pages proof is linked at the top of this README.
 
-### End-to-end training, signing, packaging, and injection
+### Image boot and hot-swap operation
 
-The pipeline wrapper runs training, export/signing, EFI build, and UART roundtrip:
+Generate a signed Solo shard, build the EFI, and package the image using the commands above. The firmware first searches UEFI `SimpleFileSystem` for `weights.bin`; if a file exists but fails validation it selects the safe identity model rather than falling through to raw NVMe. Raw fallback probes fixed byte offsets, not a general GPT scanner. For a hot-swap, `NU` supplies the candidate NVMe logical block address. An auxiliary AP reads/verifies the signed Solo record into the inactive model slot; only a fully validated candidate becomes active. This is an in-memory shadow swap, not disk A/B partitions, and requires a suitable secondary processor.
+
+### Generated artifacts and repository hygiene
+
+The repository ignores `target/`, `dist/`, nested Cargo targets, executables, PDB/Rust metadata, Python bytecode/caches, and local temp files. Cargo build products, signed test shards, trained checkpoints, disk images, QEMU logs, and injector binaries are local generated artifacts; do not add them to source control. Check the final source/docs tree with:
 
 ```powershell
-& (Join-Path $PWD 'ml/run_pure_pipeline.ps1') -Python C:/path/to/python.exe -Port 5558 -QemuAccel whpx -BlockSize 512
+git status --short
+git check-ignore target dist
 ```
 
-For separate artifact inspection, use the trainer/exporter commands in Section 2, inspect the signed shard header/hash, package with `tools/package_image.py`, then run the desired UART, host-IPC, MMIO, or hot-swap harness. Keep the development signing seed out of production workflows; replace the embedded verification key before accepting production signatures.
-
-## 6. Operational Boundaries and Limitations
-
-- The firmware accepts the signed NEUR v2 native Solo contract documented above. It rejects legacy MLP/attention model types and malformed or unsigned Solo records.
-- UART inference uses only fixed 66-byte SO ingress and six-byte SR egress frames. `NU` remains the separate 10-byte hot-swap request; there are no NB/NS/NR stream or reset frames.
-- PCIe MMIO and host-backed Shared Mailbox V2 transport the same 64-byte input vector and one 4-byte scalar decision directly. They do not store the UART preamble bytes in their ring slots.
-- The disk image contains an ESP and `NEURAL_DATA` FAT32 partition. Hot-swap uses a raw-LBA region and two in-RAM model slots; there are no disk Slot A/Slot B model partitions.
-- Raw NVMe startup fallback probes fixed offsets; it is not a partition scanner. If a filesystem shard exists but is invalid, firmware selects the safe identity model rather than scanning fallback LBAs.
-- The packager's hot-swap LBA is in 512-byte sectors; runtime `NU` is interpreted in NVMe logical blocks. QEMU tests use 512-byte blocks; convert byte offsets for a 4 KiB logical-block device.
-- The built-in signing seed and firmware public key are a known development/test pair. A custom `--key-file` seed is not trusted until its matching public key is embedded in firmware and the EFI image is rebuilt.
-- `tools/onnx2neur` accepts constrained Gemm/MatMul-only graphs, not arbitrary ONNX models. The PyTorch exporter expects its defined checkpoint layout.
-- The 13–14 TSC-cycle (~4.3 ns at a nominal 3.0 GHz) compute baseline is environment-specific. It does not establish fixed worst-case latency under QEMU, a browser, interrupts, cache/DRAM misses, thermal changes, or all UEFI platforms.
+The built-in test signing seed is public and must never be used as a production secret. Replace the embedded verification key and protect the matching signing key outside this repository for production deployments.
 
 ## License
 
