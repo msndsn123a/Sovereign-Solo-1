@@ -69,7 +69,7 @@ The deployed firmware supplies the fixed mathematical and I/O container: UEFI st
 The kernel contains no market, network-security, or industrial policy. Its model-dependent decision function is the linear ternary hyperplane:
 
 $$
-f_W(x)=\operatorname{sign}\!\left(\sum_{i=0}^{63}x_iw_i\right),\qquad W\in\{-1,0,+1\}^{64}.
+f_W(x)=\mathrm{sign}\!\left(\sum_{i=0}^{63}x_iw_i\right),\qquad W\in\{-1,0,+1\}^{64}.
 $$
 
 The 64 coefficients are the complete trainable decision surface in this appliance format and occupy 16 packed bytes in the shard. The fixed engine maps a supplied feature vector to one value in `{-1, 0, +1}`; meaning comes from the operator's feature ordering, scaling, labels, and training/validation data. The input bytes are not self-describing sensor measurements, and selecting weights alone cannot compensate for a mismatched input schema.
