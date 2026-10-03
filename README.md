@@ -56,7 +56,83 @@ Thus the **signed record is exactly 96 bytes**: 16 metadata + 64 signature + 16 
 
 After validating the header, signature, and ternary encoding, `src/main.rs` converts the exact 16-byte slice to `[u8; 16]` and calls `TernaryWeights64::from_packed` directly. It does not parse a larger MLP/attention buffer or project row zero at runtime. The production trust key in `src/crypto.rs` is the RFC 8032 test-vector public key; the default signing seed is public test material and is not a production secret. A custom seed requires installing its matching public key in firmware and rebuilding the EFI image.
 
-## 3. Wire & Transport Protocol: `SO` / `SR`
+## Dynamic Intelligence & Model Control: The Brain vs. Invariant Engine
+
+### The invariant execution engine
+
+The deployed firmware supplies the fixed mathematical and I/O container: UEFI startup, an identity-mapped CR3 switch, a polled NVMe path, signature validation, fixed-size queues, and the AVX2/scalar Solo kernel. The page-table builder maps 512 GiB using 1 GiB pages when CPUID supports them and falls back to 2 MiB pages otherwise; therefore 1 GiB pages are a capability-dependent mode, not an unconditional property. Cache Allocation Technology is configured only when the processor advertises usable L3 CAT; otherwise the firmware uses software prefetch warming. The firmware code remains fixed when a new model shard is installed, although replacing/reflashing firmware is of course still possible.
+
+The kernel contains no market, network-security, or industrial policy. Its model-dependent decision function is the linear ternary hyperplane:
+
+$$
+f_W(x)=\operatorname{sign}\!\left(\sum_{i=0}^{63}x_iw_i\right),\qquad W\in\{-1,0,+1\}^{64}.
+$$
+
+The 64 coefficients are the complete trainable decision surface in this appliance format and occupy 16 packed bytes in the shard. The fixed engine maps a supplied feature vector to one value in `{-1, 0, +1}`; meaning comes from the operator's feature ordering, scaling, labels, and training/validation data. The input bytes are not self-describing sensor measurements, and selecting weights alone cannot compensate for a mismatched input schema.
+
+Possible research policies include:
+
+- **Quantitative market signals:** map order-book/microstructure features, micro-price drift, and queue depletion into the 64 input lanes; interpret the output as an application-defined buy/hold/sell signal. This repository does not provide or validate a trading model.
+- **Network telemetry classification:** map packet timing, TCP flags, entropy, and header-derived features to lanes; interpret the scalar as a drop/transit class. This is not a complete packet parser or a certified intrusion detector.
+- **Industrial monitoring experiments:** map vibration/thermal features to lanes and use a configured scalar threshold as an interlock input. The model is not a safety-certified controller; independent hardware interlocks and domain validation remain necessary.
+
+These are examples of possible feature/weight policies, not shipped models, guaranteed accuracy, or claims that arbitrary domain input bytes produce meaningful actions. The included trainer uses synthetic data and the exporter selects a row; operators must train, validate, sign, and provision weights appropriate to their exact 64-feature schema.
+
+### Two operator model-control modes
+
+1. **Runtime in-memory hot-swap without reboot.** Send an `NU` control frame followed by the little-endian 64-bit NVMe logical block address of a candidate signed Solo shard, or stage the shard at an NVMe LBA and submit that LBA. A selected auxiliary AP claims one queued request and reads the candidate through the polled NVMe driver. The implementation calls the inactive slot `shadow_index = active_index ^ 1`; it stores a validated `LoadedModel` in `MODEL_SLOTS` and switches `ACTIVE_SHARD_INDEX` with an atomic swap only after the v2 Solo metadata, ternary payload, and Ed25519 signature pass. `ActiveModelGuard` reader counts keep a slot from being overwritten while inference still references it. There is no source type named `ShadowWeights` and no raw pointer swap; the active-slot index is the selector.
+
+   Hot-swap does not recompile or reboot the inference engine, and a failed update preserves the active model. While an update is active, the BSP temporarily defers consuming queued inference frames. The 128-entry input ring can absorb a finite burst, but sustained ingress may fill it; this design does **not** guarantee zero latency or zero dropped frames under arbitrary traffic. An available, successfully started xAPIC-addressable AP is required for update service; without one, the `NU` request is rejected.
+
+2. **Cold-boot / field provisioning.** Put a valid signed native Solo `weights.bin` on a UEFI-readable FAT filesystem and boot the appliance. Before `ExitBootServices`, firmware enumerates UEFI `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` handles and searches for `\weights.bin` and `\NEURAL_WEIGHTS\weights.bin`. The firmware accepts the payload only if it verifies against the embedded public key. No firmware compilation is required to replace a model signed by an already trusted key. A wrong key or malformed shard is rejected to the safe identity model; if a file is found but invalid, firmware does not then fall through to raw-NVMe fallback. Raw-LBA probing is used only when no filesystem model file is found.
+
+## Standalone Bootable Appliance Image (`.img`) & Field Deployment
+
+`tools/package_image.py` synthesizes a 512-byte-sector GPT image. The current layout is:
+
+| Partition/region | LBA range (512-byte sectors) | Format and content |
+|---|---:|---|
+| Partition 1: ESP | 2048–133119 | 64 MiB FAT32; `\EFI\BOOT\BOOTX64.EFI` and `STARTUP.NSH` |
+| Partition 2: `NEURAL_DATA` | 133120–264191 | 64 MiB FAT32; active `weights.bin` at the volume root |
+| Optional update area | starts at 264192 | Reserved raw NVMe space for a staged hot-swap shard |
+
+**Important filesystem distinction:** `weights.bin` is in Partition 2 (`NEURAL_DATA`), not in the ESP. The 96-byte signed Solo record generated by the builder is normally carried in a 512-byte or 4096-byte zero-padded file; firmware authenticates the 16-byte metadata plus 16-byte payload, not the padding. The image totals 266,240 sectors (130 MiB). GPT and FAT32 structures, partition starts, and files are written by the Python packager; the firmware then uses the FAT filesystem protocol to load `weights.bin` and uses polled NVMe only for raw-LBA fallback/hot-swap paths.
+
+### Synthesize the master bootable image
+
+First create a native Solo shard and build the UEFI application, then package them:
+
+```powershell
+python tools/payload_builder/build_payload.py dist/production_shard.bin --model solo --block-size 512 --variant pattern
+cargo +nightly build --target x86_64-unknown-uefi --release
+python tools/package_image.py --efi-path target/x86_64-unknown-uefi/release/neural_box_core.efi --shard-path dist/production_shard.bin --output dist/neural_box_appliance.img
+```
+
+The exact packager syntax is `python tools/package_image.py --efi-path <efi-file> --shard-path <signed-solo-shard> --output <image-file> [--hot-swap-shard <signed-solo-shard>]`. Omitting a valid default `dist/production_shard.bin` makes the script invoke the Rust builder to create its signed default Solo shard. The packager checks the basic Solo header contract; firmware signature and payload validation are authoritative.
+
+### Write to physical USB media and boot
+
+Select the whole USB device, not a partition, and double-check its identity before any raw write because choosing the wrong target destroys that device's data.
+
+- **Windows:** write `dist/neural_box_appliance.img` in raw/DD mode with Rufus, or use Win32DiskImager / another trusted raw-image writer. Do not choose an ISO/file-copy mode.
+- **Linux:** replace `/dev/sdX` only after verifying the USB device with `lsblk`:
+
+  ```bash
+  sudo dd if=dist/neural_box_appliance.img of=/dev/sdX bs=4M status=progress; sync
+  ```
+
+Boot the USB from x86-64 UEFI firmware. This is a UEFI application, not an operating-system image: it has no OS, Rust heap allocator, or runtime model service. The ESP contains `STARTUP.NSH` to launch `\EFI\BOOT\BOOTX64.EFI` in a UEFI shell; the standard removable-media EFI path is also present. Actual acceleration depends on CPU/firmware capabilities; unsupported AVX2/required vector-state configurations fall back to scalar inference, and 1 GiB CR3 pages fall back to 2 MiB pages when unavailable.
+
+### Replace `weights.bin` from Windows or Linux
+
+1. Insert the imaged USB into a workstation. Locate/mount the FAT32 `NEURAL_DATA` volume; on Windows it may appear as a drive letter (for example `D:`), or require a drive letter in Disk Management. On Linux, identify its partition with `lsblk` and mount that FAT32 partition (for example under `/media/usb`). The ESP is a separate partition and is not the model-data volume.
+2. Back up the existing `weights.bin`, then copy a newly generated and Ed25519-signed native Solo shard to `NEURAL_DATA\weights.bin`, replacing the old file. A builder output padded to 512/4096 bytes is valid; the signed metadata+payload portion is 96 bytes. Do not copy the unsigned intermediate.
+3. Ensure the shard is signed by the private key corresponding to the public key embedded in this EFI. The repository's deterministic test seed is public development material, not suitable for production. If the trust key changes, update/rebuild firmware as well.
+4. Flush writes and safely eject/unmount the volume, then return the USB to the appliance and power on. UEFI reads the file into fixed storage, verifies Ed25519, decodes the packed weights directly with `TernaryWeights64::from_packed`, and begins stateless `64 → 1` inference. Invalid or untrusted weights are rejected.
+
+These field steps replace model data without compiling firmware. They do not establish a safe operational policy: validate feature ordering, preprocessing, signed model outputs, fallback behavior, and any downstream actuator independently before deployment.
+
+## 5. Wire & Transport Protocol: `SO` / `SR`
 
 ### UART frames
 
@@ -90,7 +166,7 @@ MMIO and host-backed shared memory use the same logical 64-byte input / one-scal
 
 Total mailbox size is 4,160 bytes. Producers write a slot, publish `READY` with Release ordering, and advance the head; consumers observe state/head with Acquire ordering, compute or read the result in place, then release the slot and advance the tail. The host IPC bridge maps a 64 KiB host-backed window at guest physical address `0x1_0000_0000`. MMIO uses the IVSHMEM BAR as the shared backing region. The inbox payload is read directly by the guest compute callback; the scalar is written into the output slot rather than a 64-value array.
 
-## 4. Complete Tooling & Script Catalog
+## 6. Complete Tooling & Script Catalog
 
 Commands below are PowerShell commands run from the repository root unless noted. Windows-only host injectors require the Windows MSVC Rust toolchain. QEMU integration scripts also need the EFI image, OVMF, and their input artifacts.
 
@@ -179,7 +255,7 @@ These scripts are not the production GPT/FAT32 workflow. Several hard-code the o
 
 MMIO additionally requires a QEMU build with file-backed memory and IVSHMEM support. Host injector timing is `std::time::Instant`; firmware timing is TSC-based and represents different intervals.
 
-## 5. Appliance Build & Operational Recipes
+## 7. Appliance Build & Operational Recipes
 
 ### Host tests and microbenchmark
 
