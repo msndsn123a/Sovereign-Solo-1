@@ -1,6 +1,11 @@
 # Sovereign-Solo: Sub-5ns Deterministic Bare-Metal Scalar Inference Appliance
 
-> **[Open the Live Wasm Proof and Interactive Playground](https://msndsn123a.github.io/Sovereign-Solo-1/)** — 64 signed input lanes, one deterministic scalar decision, and an independent integer-parity check.
+[![Live WebAssembly Verification Lab](https://img.shields.io/badge/Live%20Verification%20Lab-Launch%20Interactive%20Engine-00ffff?style=for-the-badge&logo=webassembly&logoColor=black)](https://msndsn123a.github.io/Sovereign-Solo-1/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge)](LICENSE-MIT)
+[![Bare--Metal](https://img.shields.io/badge/Hardware-UEFI%20x86--64-success?style=for-the-badge)](src/main.rs)
+[![Inference Latency](https://img.shields.io/badge/Latency-13--14%20Cycles%20(~4.3ns)-orange?style=for-the-badge)](src/kernel.rs)
+
+> **Live Proof & Playground:** Launch the zero-dependency in-browser verification appliance: **[Launch Interactive Engine →](https://msndsn123a.github.io/Sovereign-Solo-1/)**
 
 Sovereign-Solo evaluates a pure feed-forward function, $x\in i8^{64}\rightarrow y\in\{-1,0,+1\}$, without recurrent state, a model server, a network connection, or a runtime heap allocator. The AVX2 compute kernel has reported a 13–14 TSC-tick minimum in host microbenchmarks (about 4.3–4.7 ns if interpreted at a nominal 3.0 GHz TSC). This is an observed compute-only result, not a physical-device guarantee or an end-to-end UART latency promise. The firmware is `no_std`; it still links its UEFI and Ed25519 Rust crates and is not literally free of code dependencies.
 
